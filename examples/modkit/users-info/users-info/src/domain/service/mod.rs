@@ -200,7 +200,13 @@ where
 }
 
 #[cfg(test)]
-mod tests_security_scoping;
+mod tests_pdp_deny;
+#[cfg(test)]
+mod tests_pdp_error;
+#[cfg(test)]
+mod tests_resource_scoping;
+#[cfg(test)]
+mod tests_tenant_scoping;
 
 #[cfg(test)]
 mod tests_entities;
