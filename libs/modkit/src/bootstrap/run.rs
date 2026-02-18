@@ -214,7 +214,7 @@ fn try_build_oop_module_config(
         return Ok(None);
     };
 
-    if runtime_cfg.mod_type != RuntimeKind::Oop {
+    if !matches!(runtime_cfg.mod_type, RuntimeKind::Oop) {
         return Ok(None);
     }
 

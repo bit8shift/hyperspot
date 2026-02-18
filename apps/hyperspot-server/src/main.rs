@@ -92,8 +92,7 @@ async fn main() -> Result<()> {
     let otel_layer = None;
 
     // Initialize logging + otel in one Registry
-    let logging_config = config.logging.clone().unwrap_or_default();
-    init_logging_unified(&logging_config, &config.server.home_dir, otel_layer);
+    init_logging_unified(&config.logging, &config.server.home_dir, otel_layer);
 
     // One-time connectivity probe
     #[cfg(feature = "otel")]

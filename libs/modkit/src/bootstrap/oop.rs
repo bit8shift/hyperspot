@@ -179,7 +179,7 @@ fn build_oop_config_and_db(
     // Merge logging: master logging (base) + local logging (override by key)
     let final_logging = merge_logging_configs(
         rendered_config.as_ref().and_then(|r| r.logging.as_ref()),
-        local_config.logging.as_ref(),
+        &local_config.logging,
     );
 
     // Build DbOptions using Figment merge + DbManager
@@ -198,20 +198,13 @@ fn build_oop_config_and_db(
 ///
 /// Each key in the logging `HashMap` (e.g., "default", "calculator", "sqlx")
 /// is overridden by local if present.
-fn merge_logging_configs(
-    master: Option<&LoggingConfig>,
-    local: Option<&LoggingConfig>,
-) -> LoggingConfig {
-    let mut result = master.cloned().unwrap_or_default();
-
-    if let Some(local_logging) = local {
-        // Local keys override master keys
-        for (key, section) in local_logging {
-            result.insert(key.clone(), section.clone());
-        }
-    }
-
-    result
+fn merge_logging_configs(master: Option<&LoggingConfig>, local: &LoggingConfig) -> LoggingConfig {
+    master
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .chain(local.clone())
+        .collect()
 }
 
 /// Builds `DbOptions` by merging rendered config from master with local config.

@@ -148,7 +148,11 @@ fn extract_config_data(cfg: &LoggingConfig) -> ConfigData<'_> {
 // ================= path helpers =================
 
 fn resolve_log_path(file: &str, base_dir: &Path) -> PathBuf {
-    let p = Path::new(file);
+    let p = if file.is_empty() {
+        Path::new("all.log")
+    } else {
+        Path::new(file)
+    };
     if p.is_absolute() {
         p.to_path_buf()
     } else {
@@ -264,7 +268,7 @@ fn build_targets(config: &ConfigData, kind: SinkKind) -> Targets {
 
         SinkKind::File { has_default_file } => {
             // default level depends on whether there is a default file sink
-            let default_level = config.default_section.and_then(|s| s.file_level).map_or(
+            let default_level = config.default_section.and_then(Section::file_level).map_or(
                 if has_default_file {
                     LevelFilter::INFO
                 } else {
@@ -277,10 +281,11 @@ fn build_targets(config: &ConfigData, kind: SinkKind) -> Targets {
 
             // per-crate rules: file sink is "active" only when path is present
             for (crate_name, section) in &config.crate_sections {
-                if section.file.trim().is_empty() {
-                    continue;
-                }
-                if let Some(level) = section.file_level.map(LevelFilter::from_level) {
+                if let Some(level) = section
+                    .section_file
+                    .as_ref()
+                    .and_then(|x| x.file_level.map(LevelFilter::from_level))
+                {
                     targets = targets.with_target(crate_name.clone(), level);
                 }
             }
@@ -328,12 +333,10 @@ impl HasMaxSizeBytes for Section {
 
 #[allow(unknown_lints, de1301_no_print_macros)] // runs during logging init, before tracing is available
 fn create_default_file_writer(section: &Section, base_dir: &Path) -> Option<RotWriter> {
-    if section.file.trim().is_empty() {
-        return None;
-    }
+    let file = section.file()?;
 
     let max_bytes = section.max_size_bytes();
-    let log_path = resolve_log_path(&section.file, base_dir);
+    let log_path = resolve_log_path(file, base_dir);
 
     if let Ok(writer) = create_rotating_writer_at_path(
         &log_path,
@@ -357,12 +360,10 @@ fn create_crate_file_writer(
     section: &Section,
     base_dir: &Path,
 ) -> Option<RotWriter> {
-    if section.file.trim().is_empty() {
-        return None;
-    }
+    let file = section.file()?;
 
     let max_bytes = section.max_size_bytes();
-    let log_path = resolve_log_path(&section.file, base_dir);
+    let log_path = resolve_log_path(file, base_dir);
 
     match create_rotating_writer_at_path(
         &log_path,

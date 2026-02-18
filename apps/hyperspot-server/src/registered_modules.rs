@@ -6,10 +6,12 @@
 use api_gateway as _;
 use authn_resolver as _;
 use authz_resolver as _;
+#[cfg(not(feature = "oop-example"))]
 use file_parser as _;
 use grpc_hub as _;
 use module_orchestrator as _;
 use nodes_registry as _;
+#[cfg(not(feature = "oop-example"))]
 use simple_user_settings as _;
 use tenant_resolver as _;
 use types as _;
