@@ -217,13 +217,21 @@ changelog_update = false
 git_release_enable = false
 
 [[package]]
-name = "cf-static-tr-plugin"
-publish = false
+name = "cf-authn-resolver-sdk"
 changelog_update = false
 git_release_enable = false
 
 [[package]]
-name = "cf-single-tenant-tr-plugin"
-publish = false
+name = "cf-authn-resolver"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-authz-resolver-sdk"
+changelog_update = false
+git_release_enable = false
+
+[[package]]
+name = "cf-authz-resolver"
 changelog_update = false
 git_release_enable = false
