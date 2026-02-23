@@ -2400,7 +2400,7 @@ A periodic background job detects and cleans up turns abandoned by crashed pods.
 **Action** (all steps in a single DB transaction, using the finalization CAS guard defined in section 5.3):
 1. Execute: `UPDATE chat_turns SET state = 'failed', error_code = 'orphan_timeout', completed_at = now() WHERE id = :turn_id AND state = 'running'`. If `rows_affected = 0`, another finalizer already completed this turn — skip to step 4 (metric only).
 2. Commit a bounded best-effort quota debit for the turn (same rule as cancel/disconnect: debit the reserved estimate).
-3. Insert a `usage_outbox` row with `outcome = "failed"`, `settlement_method = "estimated"` (see section 5.3 turn finalization contract).
+3. Insert a `usage_outbox` row with `outcome = "aborted"`, `settlement_method = "estimated"` (see section 5.3 turn finalization contract). The orphan watchdog uses billing outcome `"aborted"` (not `"failed"`) because the stream ended without a provider-issued terminal event — consistent with the ABORTED billing state (section 5.4).
 4. Emit metric: `mini_chat_orphan_turn_total` (counter, labeled by `chat_id` excluded — use only low-cardinality labels such as `{reason}` where `reason` = `timeout`).
 
 **Scheduling**: the watchdog runs as a periodic task within the module (e.g. every 60 seconds). It MUST be leader-elected or sharded to avoid duplicate transitions across replicas.
@@ -2584,26 +2584,27 @@ A turn MUST NOT transition to `completed` unless the full assistant message cont
 
 **2) failed** (terminal error):
 
-Two subcases:
+Three subcases:
 
-- **failed_pre_provider**: error before any provider call (validation, authorization, quota preflight rejection). No reserve was taken or the reserve is immediately released. Usage = 0. Emit outbox event with `outcome = "failed"`, `settlement_method = "none"`, `usage = { input_tokens: 0, output_tokens: 0 }`.
-- **failed_post_provider_start**: provider call started (stream may have begun), then a terminal error occurs (`provider_error`, `provider_timeout`, or internal error). If the provider reported usage, settle on actual usage. Otherwise settle using a bounded estimate capped by the reserved amount. Emit outbox event with `outcome = "failed"`, `settlement_method = "actual"` or `"estimated"`, and `usage` reflecting the settled amount.
+- **failed_pre_reserve**: error before a quota reserve is taken (validation error, authorization denial, quota preflight rejection — no `chat_turns` row with a reserve exists). No settlement occurs and no quota debit applies. Emitting a `usage_outbox` row is OPTIONAL (the "exactly one event per reserve" invariant does not apply because no reserve was created). If the system does emit one for observability, the row MUST use `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }`.
+- **failed_post_reserve_pre_provider**: a quota reserve was taken (the `chat_turns` row entered `IN_PROGRESS`) but the provider request was NOT issued (e.g., context assembly error, internal timeout, transient infrastructure failure between successful preflight and the outbound call). The reserve MUST be fully released (`charged_tokens = 0`). A `usage_outbox` row MUST be emitted with `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }` to satisfy the exactly-once billing event invariant. The reserve release, `chat_turns` state transition to `failed`, and outbox insertion MUST occur in a single atomic DB transaction.
+- **failed_post_provider_start**: provider call started (stream may have begun), then a terminal error occurs (`provider_error`, `provider_timeout`, or internal error). If the provider reported usage, settle on actual usage. Otherwise settle using a bounded estimate: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor)`. Emit outbox event with `outcome = "failed"`, `settlement_method = "actual"` or `"estimated"`, and `usage` reflecting the settled amount.
 
-**3) cancelled** (client disconnect / internal abort):
+**3) aborted** (client disconnect / pod crash / orphan watchdog / internal abort):
 
-- If provider usage is known (provider sent a partial usage report before cancellation), settle on actual usage.
-- Otherwise settle using the bounded best-effort debit (default: the reserved estimate), consistent with the existing cancel/disconnect rule (see section 3.2).
-- Emit outbox event with `outcome = "cancelled"`, `settlement_method = "actual"` or `"estimated"`.
+- If provider usage is known (provider sent a partial usage report before the stream ended), settle on actual usage.
+- Otherwise settle using the deterministic charged token formula: `charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor)`, consistent with the cancel/disconnect rule (see section 3.2) and the aborted-stream reconciliation (section 5.4).
+- Emit outbox event with `outcome = "aborted"`, `settlement_method = "actual"` or `"estimated"`.
 
 #### Reconciliation backstop
 
-The orphan turn watchdog (see `cpt-cf-mini-chat-component-orphan-watchdog`) serves as the reconciliation backstop. Turns that remain in `running` state beyond the configured timeout are finalized as `failed` with `error_code = 'orphan_timeout'` and a bounded best-effort debit. The watchdog MUST emit the corresponding outbox event in the same transaction as the state transition and quota settlement. This ensures that no turn can permanently evade billing.
+The orphan turn watchdog (see `cpt-cf-mini-chat-component-orphan-watchdog`) serves as the reconciliation backstop. Turns that remain in `running` state beyond the configured timeout are finalized with internal state `failed` (`error_code = 'orphan_timeout'`) and billing outcome `"aborted"` (the stream ended without a provider-issued terminal event). The watchdog MUST emit the corresponding outbox event (`outcome = "aborted"`, `settlement_method = "estimated"`) in the same transaction as the state transition and quota settlement. This ensures that no turn can permanently evade billing.
 
 ### 5.4 Non-Terminal Stream Reconciliation Invariant
 
 - [ ] `p1` - **ID**: `cpt-cf-mini-chat-design-nonterminal-reconciliation`
 
-Section 5.3 defines settlement rules for `completed`, `failed`, and `cancelled` outcomes. This subsection formalizes the deterministic reconciliation rule for streams that end without a provider-issued terminal event (`done` or `error`) — covering client disconnects, pod crashes, cancellation without provider confirmation, and orphan watchdog timeout. These cases are collectively referred to as **aborted** streams at the billing layer.
+Section 5.3 defines settlement rules for `completed`, `failed`, and `aborted` outcomes. This subsection formalizes the deterministic reconciliation rule for streams that end without a provider-issued terminal event (`done` or `error`) — covering client disconnects, pod crashes, cancellation without provider confirmation, and orphan watchdog timeout. These cases are collectively referred to as **aborted** streams at the billing layer.
 
 #### TurnExecution Billing State
 
@@ -2675,27 +2676,32 @@ This outbox row MUST be written in the **same DB transaction** as the quota sett
 
 #### Billing Event Completeness Invariant
 
-CyberChatManager MUST receive exactly one usage event for every turn that took a quota reserve, regardless of outcome:
+CyberChatManager MUST receive exactly one usage event for every turn that took a quota reserve, regardless of outcome. Pre-reserve failures (validation, authorization, quota preflight rejection) are not part of reserve settlement and do not require an outbox event.
 
-| Billing State | Outbox `outcome` | Charged |
-|---------------|-----------------|---------|
-| `COMPLETED` | `"completed"` | Actual provider usage |
-| `FAILED` (pre-provider) | `"failed"` | 0 (no reserve taken, or reserve released) |
-| `FAILED` (post-provider-start) | `"failed"` | Actual or estimated |
-| `ABORTED` | `"aborted"` | Deterministic formula or actual partial |
+| Billing State | Outbox `outcome` | `settlement_method` | Charged |
+|---------------|-----------------|---------------------|---------|
+| `COMPLETED` | `"completed"` | `"actual"` | Actual provider usage |
+| `FAILED` (pre-reserve) | _(optional)_ | `"released"` | 0 (no reserve existed) |
+| `FAILED` (post-reserve, pre-provider) | `"failed"` | `"released"` | 0 (reserve fully released) |
+| `FAILED` (post-provider-start) | `"failed"` | `"actual"` or `"estimated"` | Actual or estimated |
+| `ABORTED` | `"aborted"` | `"actual"` or `"estimated"` | Deterministic formula or actual partial |
 
-**Invariant**: it MUST be impossible for `quota_usage` to be debited without a corresponding `usage_outbox` row. The transactional atomicity guarantee (sections 5.2 and 5.3) applies to all three billing states including `ABORTED`. If the transaction fails, neither the quota debit nor the outbox row is committed.
+**Allowed outbox enum values** (no other values are valid):
+- `outcome`: `"completed"`, `"failed"`, `"aborted"`
+- `settlement_method`: `"actual"`, `"estimated"`, `"released"`
+
+**Invariant**: it MUST be impossible for `quota_usage` to be debited without a corresponding `usage_outbox` row. The transactional atomicity guarantee (sections 5.2 and 5.3) applies to all billing states that hold a reserve (COMPLETED, FAILED post-reserve, ABORTED). If the transaction fails, neither the quota debit nor the outbox row is committed.
 
 #### Pre-Provider Failure Handling
 
 If a failure occurs AFTER a quota reserve was taken but BEFORE the provider request is issued (e.g., context assembly error, internal timeout, or transient infrastructure failure between preflight and outbound call):
 
 - The reserve MUST be fully released (`charged_tokens = 0`).
-- `settlement_method` MUST be `"none"`.
+- `settlement_method` MUST be `"released"`.
 - A `usage_outbox` row MUST still be emitted with `outcome = "failed"` and `usage = { input_tokens: 0, output_tokens: 0 }` to preserve the exactly-once billing event invariant. CyberChatManager receives a zero-charge event rather than no event.
 - The reserve release, `chat_turns` state transition to `failed`, and outbox insertion MUST occur in a single atomic DB transaction.
 
-This eliminates the ambiguity between "reserve taken, provider not called" and "reserve taken, provider called, stream aborted". The former always settles at zero; the latter uses the deterministic charged token formula.
+This eliminates the ambiguity between "reserve taken, provider not called" and "reserve taken, provider called, stream aborted". The former always settles at zero with `settlement_method = "released"`; the latter uses the deterministic charged token formula with `settlement_method = "estimated"`.
 
 #### Operational Metric
 
@@ -2719,16 +2725,17 @@ Section 5.3 defines the `failed` outcome taxonomy (pre-provider vs. post-provide
 **A) Failure before reserve is taken** (validation error, authorization denial, quota preflight rejection — i.e., the failure occurs before or during preflight, so no `chat_turns` row with a reserve exists):
 
 - No quota settlement occurs (there is no reserve to release).
-- Emitting a `usage_outbox` row is OPTIONAL. If the system does emit one, the row MUST use `outcome = "failed"`, `settlement_method = "none"`, `usage = { input_tokens: 0, output_tokens: 0 }`, and MUST follow the standard deduplication keys `(turn_id, request_id)` so that consumers can safely ignore duplicates.
+- Emitting a `usage_outbox` row is OPTIONAL. The "exactly one event per reserve" invariant does not apply because no reserve was created. If the system does emit one for observability, the row MUST use `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }`, and MUST follow the standard deduplication keys `(turn_id, request_id)` so that consumers can safely ignore duplicates.
 - No billing state transition applies (no `chat_turns` row was created, or the row never entered `IN_PROGRESS`).
+- Pre-reserve failures are NOT part of "reserve settlement". They exist outside the billing lifecycle that begins with reserve creation.
 
 **B) Failure after reserve is taken but before provider invocation** (context assembly error, internal timeout, or transient infrastructure failure between successful preflight and the outbound provider call):
 
 - The reserve MUST be fully released (`charged_tokens = 0`).
-- A `usage_outbox` row MUST be emitted with `outcome = "failed"`, `settlement_method = "none"`, `usage = { input_tokens: 0, output_tokens: 0 }` to satisfy the exactly-once billing event invariant (section 5.3). CyberChatManager receives a zero-charge event rather than no event.
+- A `usage_outbox` row MUST be emitted with `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }` to satisfy the exactly-once billing event invariant (section 5.3). CyberChatManager receives a zero-charge event rather than no event.
 - The reserve release, `chat_turns` state transition to `failed`, and outbox insertion MUST occur in a single atomic DB transaction (consistent with section 5.4, "Pre-Provider Failure Handling").
 
-This distinction eliminates ambiguity: case (A) never holds a reserve and has no settlement obligation; case (B) holds a reserve that MUST be released with a mandatory outbox event. Both cases result in zero charges. The provider is never called in either case.
+This distinction eliminates ambiguity: case (A) never holds a reserve and has no settlement obligation; case (B) holds a reserve that MUST be released with a mandatory outbox event (`settlement_method = "released"`). Both cases result in zero charges. The provider is never called in either case.
 
 The remainder of this subsection addresses **post-stream terminal errors** exclusively.
 
@@ -2743,15 +2750,16 @@ When the provider issues a terminal `event: error` after streaming has started, 
 
 2. **If the provider did NOT report actual usage**:
    ```text
-   charged_tokens = min(reserve_tokens, estimated_input_tokens)
+   charged_tokens = min(reserve_tokens, estimated_input_tokens + minimal_generation_floor)
    ```
    Where:
    - `reserve_tokens` — the persisted preflight reserve from the `chat_turns` row.
    - `estimated_input_tokens` — token estimate of the `ContextPlan` sent to the provider (derived from `reserve_tokens - max_output_tokens` using the deployment-configured `max_output_tokens`).
+   - `minimal_generation_floor` — the same configurable constant used in the ABORTED formula (section 5.4, default: 50 tokens).
 
-**Critical constraint**: the system MUST NEVER charge the full `reserve_tokens` unless the provider explicitly reports usage equal to or exceeding the reserve. When no provider usage is available, the charge is bounded by the estimated input cost, reflecting that the provider received the prompt but may not have produced significant output.
+**Critical constraint**: the system MUST NEVER charge the full `reserve_tokens` unless the provider explicitly reports usage equal to or exceeding the reserve. When no provider usage is available, the charge is bounded by the estimated input cost plus `minimal_generation_floor`, reflecting that the provider received the prompt and may have consumed resources before the error.
 
-**Relation to ABORTED `minimal_generation_floor` (section 5.4)**: The ABORTED reconciliation formula (section 5.4) includes a `minimal_generation_floor` addend to prevent zero-charge exploitation when a stream ends without a provider-issued terminal event — the provider may still be processing or may have generated output that was never acknowledged. In contrast, a post-stream terminal `error` is an explicit provider signal that processing has stopped. The provider had the opportunity to report usage in the error payload; if it did not, the system assumes only input tokens were consumed. Accordingly, `minimal_generation_floor` MUST NOT be applied to post-stream terminal error settlement. If the provider reports actual usage that includes output tokens, those tokens are charged via the actual-usage path (case 1 above), making a floor unnecessary.
+**Consistency with ABORTED formula (section 5.4)**: The `minimal_generation_floor` is applied identically in both the ABORTED and the post-stream terminal error reconciliation formulas. In both cases, the provider request was issued and the provider may have consumed compute resources even if it did not report usage. The floor ensures a non-zero minimum charge for any invocation that reached the provider, regardless of whether the stream ended with an explicit terminal error or an unacknowledged interruption. If the provider reports actual usage (case 1 above), those tokens are charged directly, making the floor unnecessary.
 
 #### State Transition
 
@@ -2804,13 +2812,23 @@ Multiple terminal signals may arrive concurrently or in rapid succession for the
 
 **Combined guarantee**: for any turn that took a quota reserve, exactly one finalization transaction succeeds — performing the state transition, quota settlement, and outbox insertion atomically. All competing terminal signals either lose the CAS race (and become no-ops) or are blocked by the outbox unique constraint. It MUST be impossible for a single turn to produce more than one `usage_outbox` row or to have its quota debited more than once.
 
-**Example scenario**: a provider returns a terminal `event: error` (with `error_code = 'provider_error'`), and 50ms later the client disconnects, triggering the cancellation path:
+**Race resolution rule**: both the terminal-error path and the disconnect/abort path attempt finalization using the same DB CAS guard (`WHERE state = 'running'`). Whichever commits first wins and emits the single outbox event. The loser observes `rows_affected = 0` and MUST NOT emit anything and MUST NOT debit quota. No advisory locks or in-memory coordination are required — the DB CAS guard is the sole arbitration mechanism.
+
+**Scenario 1 — Disconnect after terminal error**: the provider returns a terminal `event: error`, and the client subsequently disconnects (or the disconnect signal arrives after the error is processed):
 
 1. The error-handling path begins a finalization transaction: `UPDATE chat_turns SET state = 'failed' WHERE id = :turn_id AND state = 'running'` — affects 1 row. The transaction proceeds to settle quota using the post-stream terminal error reconciliation rule (section 5.5), inserts a `usage_outbox` row with `outcome = "failed"`, and commits atomically. The turn is now finalized as `FAILED`.
-2. The cancellation path, triggered by client disconnect, attempts its own finalization: `UPDATE chat_turns SET state = 'cancelled' WHERE id = :turn_id AND state = 'running'` — affects 0 rows (state is already `failed`). The cancellation path MUST treat this as a no-op: no quota settlement, no outbox insertion, no further action on this turn.
+2. The disconnect/cancellation path attempts its own finalization: `UPDATE chat_turns SET state = 'cancelled' WHERE id = :turn_id AND state = 'running'` — affects 0 rows (state is already `failed`). The cancellation path MUST treat this as a no-op: no quota settlement, no outbox insertion, no further action on this turn.
 3. The orphan watchdog, if it later scans this turn, observes `state = 'failed'` (not `running`) and skips it.
 
-The recorded outcome is `FAILED` with the settlement computed by the error path. The disconnect signal is silently discarded. No double settlement occurs.
+The disconnect after a terminal error is **irrelevant** — the terminal error already finalized the turn. The recorded outcome is `FAILED` with the settlement computed by the error path. No double settlement occurs.
+
+**Scenario 2 — Terminal error after disconnect** (disconnect arrives first, terminal error signal is delayed or arrives during abort processing):
+
+1. The disconnect/abort path begins a finalization transaction: `UPDATE chat_turns SET state = 'cancelled' WHERE id = :turn_id AND state = 'running'` — affects 1 row. The transaction proceeds to settle quota using the ABORTED reconciliation formula (section 5.4), inserts a `usage_outbox` row with `outcome = "aborted"`, and commits atomically. The turn is now finalized as `ABORTED`.
+2. The terminal error signal arrives. The error-handling path attempts: `UPDATE chat_turns SET state = 'failed' WHERE id = :turn_id AND state = 'running'` — affects 0 rows (state is already `cancelled`). The error path MUST treat this as a no-op.
+3. If the disconnect path did NOT succeed (e.g., the pod crashed before committing), the turn remains in `running` state. The orphan watchdog will eventually finalize it as `failed` with `error_code = 'orphan_timeout'` — but only if the turn is still `IN_PROGRESS` (`running`). If another finalizer committed in the interim, the watchdog's CAS also returns 0 rows and it skips the turn.
+
+The terminal error after a disconnect is handled by the abort/watchdog finalizer, but **only if the turn is still `IN_PROGRESS`**. If the disconnect already finalized the turn, the late error signal is silently discarded.
 
 ### 5.6 Deferred to P2+
 

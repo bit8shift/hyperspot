@@ -448,9 +448,9 @@ When a chat is deleted, the system MUST mark attachments for asynchronous cleanu
 - Integration is asynchronous: Mini Chat emits a usage event (via EventManager) after each turn reaches a terminal state. CyberChatManager consumes events and updates credit balances.
 - Usage events MUST be idempotent (keyed by `turn_id` / `request_id`).
 - No synchronous billing RPC is required during message execution.
-- All LLM invocations that take a quota reserve produce exactly one terminal billing event (completed, failed, or aborted), ensuring no credit drift under disconnect or crash scenarios.
+- All LLM invocations that take a quota reserve produce exactly one terminal billing event (completed, failed, or aborted), ensuring no credit drift under disconnect or crash scenarios. Pre-reserve failures (validation, authorization, quota preflight rejection) are not part of reserve settlement and do not require a billing event.
 - Exactly one terminal settlement per reserved invocation, enforced via DB-atomic conditional finalization (CAS guard on turn state). No in-memory locks; all finalization paths — including the orphan watchdog — use the same database-level mutual exclusion.
-- Failed LLM invocations that reach the provider may incur token charges and are billed accordingly based on actual consumption.
+- Failed LLM invocations that reached the provider may incur token charges (input and/or output) and are billed accordingly based on actual consumption or a bounded estimate when actual usage is unavailable.
 
 **Deferred to P2+**: detailed billing integration contracts (event schemas, RPC interfaces, outbox requirements, credit proxy endpoints). See DESIGN.md section 5 for additional context.
 
