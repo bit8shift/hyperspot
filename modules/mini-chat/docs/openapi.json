@@ -1727,8 +1727,8 @@
           },
           "downgrade_reason": {
             "type": "string",
-            "enum": ["premium_quota_exhausted", "kill_switch"],
-            "description": "Why downgrade occurred. Present only when quota_decision=\"downgrade\"."
+            "enum": ["premium_quota_exhausted", "force_standard_tier", "disable_premium_tier", "model_disabled"],
+            "description": "Why downgrade occurred. Present only when quota_decision=\"downgrade\". Values: premium_quota_exhausted (user quota exhausted); force_standard_tier (operator kill switch: premium tier forcibly disabled for this tenant); disable_premium_tier (operator kill switch: premium tier globally disabled); model_disabled (operator kill switch: selected model global_enabled=false)."
           }
         }
       },

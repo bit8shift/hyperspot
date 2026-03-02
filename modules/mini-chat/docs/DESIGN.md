@@ -383,6 +383,8 @@ Reserve is an internal accounting concept (it may be implemented as held/pending
 
 All period boundaries use UTC. Per-tenant timezone configuration (`quota_timezone`) is deferred to P2+. Additional periods (4-hourly rolling windows, weekly) are deferred to P2+.
 
+**Quota period boundary invariant (normative)**: All settlement operations (reserve release and commit) MUST target the same `(period_type, period_start)` bucket rows as the original reserve. The `period_start` values are computed at preflight time and MUST NOT be recomputed at settlement time using the current clock. Implementations MUST persist the preflight `period_start` values alongside the reserve (e.g., in the `chat_turns` row or in context passed to the settlement path) and use those persisted values for all subsequent settlement operations. This ensures that in-flight reserves straddling period boundaries (e.g., a turn started at 23:59:59 UTC and completed at 00:00:01 UTC) are settled against the correct day-1 bucket rows rather than incorrectly targeting day-2 — which would cause `reserved_credits_micro` in day-1 to remain permanently inflated while day-2 is double-reserved.
+
 #### Quota Warning Thresholds (P2+)
 
 Quota warning thresholds (`warning_threshold_pct`, `quota_warnings` array in the SSE `done` event) are deferred to P2+. P1 does not emit quota warning notifications in the SSE stream.
@@ -884,7 +886,7 @@ Finalizes the stream. Provides usage and model selection metadata.
 | `selected_model` | string | Model chosen at chat creation (`chats.model`). Always present. Equals `effective_model` when no downgrade occurred. |
 | `quota_decision` | `"allow"` \| `"downgrade"` (required) | Always present. `"allow"` when the turn used the selected model without override; `"downgrade"` when a quota-driven downgrade occurred. |
 | `downgrade_from` | string (optional) | Always equals `selected_model` when present — the model from which the quota-driven downgrade occurred. Present only when `quota_decision="downgrade"`. |
-| `downgrade_reason` | string (optional) | Why downgrade occurred: `"premium_quota_exhausted"` or `"kill_switch"`. Present only when `quota_decision="downgrade"`. |
+| `downgrade_reason` | string (optional) | Why downgrade occurred. Present only when `quota_decision="downgrade"`. Values: `"premium_quota_exhausted"` (user's premium quota exhausted — quota-driven downgrade); `"force_standard_tier"` (operator kill switch: premium tier forcibly disabled for this tenant via `force_standard_tier=true`); `"disable_premium_tier"` (operator kill switch: premium tier globally disabled via `disable_premium_tier=true`); `"model_disabled"` (operator kill switch: the selected model's `global_enabled=false`). |
 | `quota_warnings` | array of objects (optional) | Deferred to P2+. Not emitted in P1. |
 
 ##### `event: error`
@@ -1011,6 +1013,11 @@ For streaming endpoints, failures before any streaming begins MUST be returned a
 | `model_not_found` | 404 | Model does not exist in the catalog or is not visible to the user (globally disabled or user-disabled). Used by `GET /v1/models/{model_id}`. |
 | `provider_error` | 502 | LLM provider returned an error |
 | `provider_timeout` | 504 | LLM provider request timed out |
+| `web_search_calls_exceeded` | — (SSE only) | Per-message web search tool call limit exceeded mid-turn. Emitted as terminal `event: error` payload only; no HTTP error status is used because the stream is already open. The turn is finalized as `failed` with `settlement_method="actual"\|"estimated"`. |
+| `invalid_turn_state` | 400 | Retry, edit, or delete attempted on a turn that is not in a terminal state (turn is `running`). Always pre-stream JSON. |
+| `not_latest_turn` | 409 | Retry, edit, or delete targeted a turn that is not the most recent non-deleted turn for the chat. Always pre-stream JSON. |
+| `message_not_found` | 404 | Target message does not exist or is not accessible. Used by reaction endpoints. Always pre-stream JSON. |
+| `invalid_reaction_target` | 400 | Reaction attempted on a message type that does not support reactions (e.g., system messages). Always pre-stream JSON. |
 
 **Quota error disambiguation invariant**: token quota exhaustion, upload quota exhaustion, and web search quota exhaustion MUST be distinguishable to clients via the stable, machine-readable `quota_scope` field on every `quota_exceeded` error response. Clients MUST NOT parse the `message` string to determine quota scope. The `quota_scope` field is REQUIRED when `code` is `quota_exceeded` and MUST be one of: `"tokens"` (token-based rate limit exhaustion), `"uploads"` (per-user daily upload limit exhaustion), or `"web_search"` (per-user daily web search call limit exhaustion).
 
@@ -1321,7 +1328,7 @@ sequenceDiagram
   - **Resize policy**: fit inside configured `thumbnail_width` x `thumbnail_height` (deployment config), preserve aspect ratio, no cropping. Default target: 128x128 pixels.
   - **Output format**: `image/webp` (fixed).
   - **Size bound**: the decoded thumbnail (raw binary bytes) MUST NOT exceed `thumbnail_max_bytes` (default: 131072 bytes / 128 KiB). The enforced limit is on decoded bytes, not the base64 string size. If the produced thumbnail exceeds this limit, the server reduces quality or skips thumbnail generation (attachment still transitions to `ready` with `img_thumbnail = null`).
-  - **Security safeguard — max pixels**: before decoding, the server MUST check the image header dimensions. If `width * height` exceeds `thumbnail_max_pixels` (default: 100,000,000), thumbnail generation is skipped to prevent pixel-bomb memory exhaustion. The attachment may still become `ready` (the provider upload succeeded), but `img_thumbnail` remains null.
+  - **Security safeguard — max pixels**: before decoding, the server MUST check the image header dimensions. If `width * height` exceeds `thumbnail_max_pixels` (default: 100,000,000), thumbnail generation is skipped. The header-dimension check is a pre-screening heuristic only, not a security boundary — malformed images may advertise small header dimensions while expanding to gigabytes on decode. Therefore, the `image` crate MUST be invoked with a size-limited `Read` wrapper that caps the total bytes the decoder may consume to `thumbnail_max_decode_bytes` (default: 33,554,432 bytes / 32 MiB, deployment-configurable) regardless of header dimensions. If decoding exceeds `thumbnail_max_decode_bytes`, thumbnail generation MUST be aborted and the attachment may still become `ready` with `img_thumbnail = null`.
   - **Failure tolerance**: if thumbnail generation fails for any reason (decode error, unsupported sub-format, memory pressure), the attachment processing MAY still succeed — the attachment transitions to `ready` with `img_thumbnail = null`. Thumbnail failure does not set `error_code` on the attachment; `error_code` is only set when the attachment itself fails (e.g., provider upload failure).
 
   **Thumbnail configuration knobs** (deployment config):
@@ -1331,7 +1338,8 @@ sequenceDiagram
   | `thumbnail_width` | integer | 128 | Target thumbnail width in pixels |
   | `thumbnail_height` | integer | 128 | Target thumbnail height in pixels |
   | `thumbnail_max_bytes` | integer | 131072 | Maximum decoded thumbnail size in bytes (128 KiB) |
-  | `thumbnail_max_pixels` | integer | 100000000 | Maximum source image pixel count (`width * height`) before skipping thumbnail generation |
+  | `thumbnail_max_pixels` | integer | 100000000 | Maximum source image pixel count (`width * height`) before skipping thumbnail generation (pre-screening heuristic) |
+  | `thumbnail_max_decode_bytes` | integer | 33554432 | Maximum bytes the image decoder may consume before aborting (32 MiB). Security boundary against pixel-bomb attacks where malformed images advertise small header dimensions but expand to gigabytes on decode. |
 
 Attachment kind is derived from `content_type`: MIME types matching `image/png`, `image/jpeg`, or `image/webp` are classified as `image`; all other supported types are classified as `document`.
 
@@ -2124,6 +2132,7 @@ A turn is a user-message + assistant-response pair identified by `request_id` in
 3. Retry, edit, and delete are allowed only if the target turn is in a terminal state (`completed`, `failed`, or `cancelled`). If the turn is `running`, reject with `400 Bad Request` — the client must wait for completion or cancel by disconnecting the SSE stream (see `cpt-cf-mini-chat-seq-cancellation`).
 4. Retry and edit soft-delete the previous turn (set `deleted_at`) and set `replaced_by_request_id` on the old turn pointing to the new turn's `request_id`. Delete sets `deleted_at` only (no replacement turn). Mutation eligibility considers only non-deleted turns, so delete cannot target an already replaced (soft-deleted) turn.
 5. Soft-deleted turns (`deleted_at IS NOT NULL`) are excluded from active conversation history and context assembly but retained in storage for audit traceability.
+6. **Atomicity invariant (normative)**: The "latest turn" identity check (rule 1), the terminal state check (rule 3), the soft-delete of the old turn, and the INSERT of the new `running` turn MUST all execute within a single DB transaction using `SELECT FOR UPDATE` or equivalent serializable isolation. Without this, two concurrent retry/edit requests for the same turn can both pass the validation checks simultaneously, both soft-delete the old turn (the second soft-delete is a no-op since `deleted_at` is already set), and both attempt to INSERT a new running turn — which violates the `UNIQUE(chat_id) WHERE state = 'running' AND deleted_at IS NULL` index. If the new running turn INSERT fails due to this unique constraint (concurrent race condition), the mutation MUST return `409 Conflict` with `code = "generation_in_progress"` (not HTTP 500).
 
 #### Turn Mutation API Contracts
 
@@ -2420,17 +2429,17 @@ Web search quota enforcement follows deterministic preflight checks with no retr
 3. **Per-Message Tool Call Limit**: During turn execution, track web_search tool calls made by the provider.
    - Hard limit: `max_calls_per_message` (configurable, default: 2)
    - If exceeded mid-turn:
-     - Finalize turn as `failed` with error_code (not `quota_exceeded`)
+     - Finalize turn as `failed` with `error_code = "web_search_calls_exceeded"` (not `quota_exceeded`)
      - Settle tokens based on actual/estimated usage at that point
      - **NO REFUNDS**: Do NOT attempt to refund surcharge tokens
-     - Emit outbox event with `outcome="failed"`, `settlement_method="actual"|"estimated"`
+     - Emit outbox event with `outcome="failed"`, `settlement_method="actual"` (if provider reported partial usage) OR `"estimated"` (if no usage available)
 
 **No Refund Logic**: If tool call limit is breached mid-turn, the system finalizes the turn as failed and settles using available usage data. The web_search_surcharge_tokens applied at preflight are NOT refunded. Mid-turn failures are treated as normal terminal errors with deterministic settlement (section 5.7).
 
 **Error Codes Summary**:
 - `web_search_disabled` → HTTP 400 (kill switch active)
 - `quota_exceeded` with quota_scope=`"web_search"` → HTTP 429 (daily quota exhausted)
-- Tool call limit breach → HTTP 200 + SSE `event: error` with application error code (not HTTP 429)
+- `web_search_calls_exceeded` → HTTP 200 + SSE `event: error` (per-message tool call limit breached mid-turn; not HTTP 429; turn finalized as `failed`)
 
 ### File Search Retrieval Scope
 
@@ -2490,6 +2499,18 @@ To prevent retrieval quality degradation on large document sets:
 All values are configurable per deployment. The domain service enforces `max_documents_per_chat`, `max_total_upload_mb_per_chat`, and `max_chunks_per_chat` at upload time (reject with HTTP 400 if exceeded). Retrieval-time controls (`max_retrieved_chunks_per_turn`, `max_retrieved_tokens_per_turn`, `retrieval_k`) are enforced during context plan assembly.
 
 Since each chat has a dedicated vector store, these limits directly bound the size of each vector store. The `max_chunks_per_chat` limit (default: 10,000) serves as both a RAG quality control and a vector store growth guardrail. No additional per-user aggregate limit is enforced at P1; operators can monitor total vector store count per user via metrics (`mini_chat_vector_stores_per_user` gauge).
+
+#### File Search Per-Message Call Limit Enforcement (P1)
+
+The file search per-message call limit (`max_calls_per_message`, default: 2) is enforced at **preflight only** in P1.
+
+**Preflight enforcement**: The `file_search_surcharge_tokens` budget included in the reserve estimate covers up to `max_calls_per_message` invocations. No mid-stream monitoring or hard stop is implemented for file_search calls in P1. There is no `file_search_calls_exceeded` error code or mid-turn finalization path for file_search at P1 scope.
+
+**Post-hoc accounting**: After the provider reports actual token usage, the system applies standard commit-vs-reserve settlement regardless of how many file_search calls the provider actually made. If the provider makes fewer calls than budgeted, actual token usage is lower and any underspend is released. If the provider makes more calls than `max_calls_per_message`, the additional token cost is subject to the standard `overshoot_tolerance_factor` cap — overruns beyond tolerance are capped at `reserve_tokens` per §5.4.5. No separate mid-stream enforcement, error_code, or settlement exception applies.
+
+**Rationale**: Unlike web search (which incurs discrete per-call surcharges tracked in a daily quota bucket requiring mid-turn enforcement), file_search surcharge tokens are a fixed per-turn budget estimate baked into the reserve. Enforcement at preflight by sizing the reserve to cover `max_calls_per_message` calls provides sufficient cost bounding without requiring SSE event monitoring. Mid-stream abort on file_search call count exceed (analogous to web search's Mid-Turn Hard Limit Enforcement) is deferred to P2+.
+
+**Scope note**: Operators can detect excessive file_search call usage via audit logs. Per-message mid-stream file_search call count enforcement is explicitly out of P1 scope.
 
 ### Model Catalog Configuration
 
@@ -4155,9 +4176,11 @@ In the normal scheme you should not exceed limits, because:
       - Increment telemetry by ACTUAL tokens: `input_tokens += actual_input_tokens; output_tokens += actual_output_tokens`
 
    3. **Outbox events (usage snapshots):**
-      - Emit COMMITTED credits: `actual_credits_micro` field contains `committed_credits_micro` (confusing name, intentional for backward compat)
+      - Emit COMMITTED credits: `actual_credits_micro` field contains `committed_credits_micro` (confusing name, intentional for backward compat — do NOT rename; see migration note)
+      - **Emit `committed_credits_micro` as an explicit mandatory field** alongside `actual_credits_micro`. This is the authoritative billing amount. Downstream consumers (CCM) MUST use `committed_credits_micro` as the definitive charge; `actual_credits_micro` is retained for legacy compatibility only.
       - Emit ACTUAL tokens for telemetry: `usage.input_tokens`, `usage.output_tokens`
       - Emit overshoot flag: `overshoot_capped: bool` (true when committed < actual)
+      - **Migration note**: renaming `actual_credits_micro` → `committed_credits_micro` is deferred to P2+. For P1, both fields MUST be emitted with the same value. CCM MUST be explicitly instructed during integration to use `committed_credits_micro` as the authoritative billing amount.
 
    4. **Audit events:**
       - Log BOTH actual and committed values for reconciliation
@@ -4182,7 +4205,8 @@ In the normal scheme you should not exceed limits, because:
 
    Emitted in outbox:
      usage: { input_tokens: 11000, output_tokens: 500 }  (actual)
-     actual_credits_micro: 2500000  (committed, despite name)
+     actual_credits_micro: 2500000  (committed, despite name — legacy field for backward compat)
+     committed_credits_micro: 2500000  (authoritative billing amount; CCM MUST use this field)
      overshoot_capped: true
    ```
 
@@ -4586,6 +4610,8 @@ fn construct_dedupe_key(tenant_id: Uuid, turn_id: Uuid, request_id: Uuid) -> Str
 
 **Dedupe / unique constraint**: the partial unique index `(namespace, topic, dedupe_key) WHERE dedupe_key IS NOT NULL` on `modkit_outbox_events` enforces at most one outbox event per turn invocation at the database level. All finalizers MUST insert the outbox row within the same transaction as the guarded state transition (CAS on `chat_turns.state = 'running'`, section 5.7) and quota settlement.
 
+**Initial row state (normative)**: outbox rows MUST be inserted with `status = 'pending'`, `attempts = 0`, `next_attempt_at = now()` (eligible for immediate dispatch), `locked_by = NULL`, `locked_until = NULL`. The `attempts` column MUST start at `0` so that the first claim increment produces `attempts = 1` and the first retry backoff is `min(2^1 * base_delay, max_delay)`. Inserting with `attempts = 1` would shift the entire backoff curve by one step and is incorrect.
+
 **Conflict semantics (normative)**: the outbox INSERT MUST use `INSERT ... ON CONFLICT (namespace, topic, dedupe_key) WHERE dedupe_key IS NOT NULL DO NOTHING` (or the equivalent ORM upsert-ignore). If the INSERT returns zero rows affected (dedupe conflict), the finalizer MUST treat the event as already emitted and MUST NOT re-emit. The finalizer MUST NOT raise an error to the caller on dedupe conflict — the duplicate is a normal idempotency outcome, not an error condition.
 
 **Transactional rule**: the quota usage commit (updating `quota_usage` bucket rows) and the outbox row insert MUST happen in the same database transaction. If either fails, the entire transaction rolls back. This guarantees that every committed quota change has a corresponding pending event.
@@ -4601,7 +4627,14 @@ fn construct_dedupe_key(tenant_id: Uuid, turn_id: Uuid, request_id: Uuid) -> Str
 > * `base_delay` — base retry delay in seconds. **Configuration source (P1)**: read from MiniChat ConfigMap key `outbox_dispatcher.base_delay_seconds` (integer). Default value: `2`. MUST be validated at startup: `1 <= base_delay_seconds <= 60`.
 > * `max_delay` — maximum retry delay cap in seconds. **Configuration source (P1)**: read from MiniChat ConfigMap key `outbox_dispatcher.max_delay_seconds` (integer). Default value: `300` (5 minutes). MUST be validated at startup: `base_delay_seconds <= max_delay_seconds <= 3600`.
 > * `now()` — current database server time (UTC)
-> * **Transient failure classification (P1)**: any publish error that does not conclusively indicate permanent unrecoverability (e.g., network timeout, HTTP 5xx, connection refused). Permanent failures are identified in step 4.
+> * **Transient failure classification (P1 normative)**: The following error classes MUST be treated as transient (retried with exponential backoff):
+>   - Connection-level: TCP timeout, connection refused, DNS resolution failure
+>   - HTTP 408 (Request Timeout), HTTP 429 (Too Many Requests), HTTP 5xx (all server-side errors)
+>
+>   The following MUST be treated as immediately permanent (skip retry backoff, transition directly to `status = 'dead'`):
+>   - HTTP 400, 401, 403, 404, 410, 422 — client errors indicating the request is structurally invalid or permanently rejected by the plugin; retrying will not succeed.
+>
+>   All other error classes default to transient until `max_attempts` is exhausted.
 
 4. On permanent failure (attempts exceed configured max), set `status = 'dead'` and emit an alert metric.
 
@@ -4669,7 +4702,7 @@ At-least-once delivery is allowed; duplicates are possible (see Idempotency rule
 
    `last_error` MUST be sanitized to avoid provider identifier leakage (same redaction rules as audit events).
 
-**Lease expiry reclaim rule**: if `now() > locked_until` and `status = 'processing'`, any dispatcher MAY reclaim the row by transitioning it back to `pending` (setting `locked_by = NULL`, `locked_until = NULL`). This handles the case where the claiming dispatcher crashes after the claim transaction but before publishing.
+**Lease expiry reclaim rule**: if `now() > locked_until` and `status = 'processing'`, any dispatcher MAY reclaim the row by transitioning it back to `pending` (setting `locked_by = NULL`, `locked_until = NULL`). This handles the case where the claiming dispatcher crashes after the claim transaction but before publishing. **`attempts` MUST NOT be incremented during reclaim** — the count was already incremented when the row was originally claimed in step 2 above. Incrementing again on reclaim would over-count attempts and apply more aggressive exponential backoff than intended, risking premature dead-lettering on rows where the original dispatcher silently crashed.
 
 **State transition invariant**: a row transitions `pending → processing → delivered` monotonically. `delivered` is terminal. The only non-forward transition is `processing → pending` on publish failure or lease expiry, which allows retry. A row MUST NOT transition from `delivered` to any other status. Rows that exhaust `max_attempts` transition to `dead` (terminal).
 
@@ -5074,6 +5107,9 @@ pub enum TurnErrorCode {
     ProviderTimeout,      // Provider request timed out
     RateLimited,          // Provider throttling after retries exhausted
 
+    // Tool enforcement errors (terminal, mid-turn, after stream started)
+    WebSearchCallsExceeded, // Per-message web_search tool call limit breached mid-turn
+
     // Pre-provider errors (terminal, before stream started)
     ContextLengthExceeded, // Context budget exceeded at preflight
     ValidationError,       // Request validation failed (malformed input)
@@ -5088,6 +5124,7 @@ impl TurnErrorCode {
             Self::ProviderError => "provider_error",
             Self::ProviderTimeout => "provider_timeout",
             Self::RateLimited => "rate_limited",
+            Self::WebSearchCallsExceeded => "web_search_calls_exceeded",
             Self::ContextLengthExceeded => "context_length_exceeded",
             Self::ValidationError => "validation_error",
             Self::OrphanTimeout => "orphan_timeout",
@@ -5119,6 +5156,7 @@ impl TurnErrorCode {
 |------------------------------|-----------------|------------------|---------------------------|-------|
 | `state = 'completed'` | `COMPLETED` | `"completed"` | `"actual"` | Normal success; provider reported full usage |
 | `state = 'failed'` AND `error_code IN ('provider_error', 'provider_timeout', 'rate_limited')` | `FAILED` | `"failed"` | `"actual"` (if provider reported partial usage) OR `"estimated"` (if no usage available) | Provider terminal error after streaming started |
+| `state = 'failed'` AND `error_code = 'web_search_calls_exceeded'` | `FAILED` | `"failed"` | `"actual"` (if provider reported partial usage) OR `"estimated"` (if no usage available) | Per-message tool call limit breached mid-turn; turn was post-provider-start; mirrors `provider_error` settlement. MUST NOT use `"released"` even if partial usage is unavailable — the provider was already called. |
 | `state = 'failed'` AND `error_code IN ('context_length_exceeded', 'validation_error')` AND reserve was taken | `FAILED` | `"failed"` | `"released"` | Pre-provider failure after reserve; zero charge |
 | `state = 'cancelled'` (client disconnect) | `ABORTED` | `"aborted"` | `"actual"` (if provider reported partial usage) OR `"estimated"` (use deterministic formula) | Stream ended without provider terminal event |
 | `state = 'failed'` AND `error_code = 'orphan_timeout'` (watchdog) | `ABORTED` | `"aborted"` | `"estimated"` (MUST use deterministic formula from section 5.8) | Watchdog cleanup; no provider terminal event received |
@@ -5251,10 +5289,10 @@ Section 5.7 defines the `failed` outcome taxonomy (pre-provider vs. post-provide
 - No quota settlement occurs (there is no reserve to release).
 - Emitting a `modkit_outbox_events` row is OPTIONAL. The "exactly one event per reserve" invariant does not apply because no reserve was created. If the system does emit one for observability, the row MUST use `outcome = "failed"`, `settlement_method = "released"`, `usage = { input_tokens: 0, output_tokens: 0 }`, and MUST use a stable `dedupe_key` derived from `(tenant_id, turn_id, request_id)` so that consumers can safely ignore duplicates.
 
-> **turn_id generation for pre-reserve failures**: if no `chat_turns` row exists (failure during validation or authorization before INSERT), the implementation MUST either (1) not emit an outbox event (OPTIONAL branch) or (2) generate a server-side UUID v4 as `turn_id` for dedupe_key construction only (this UUID is not persisted in `chat_turns`). The `request_id` is always available (client-provided or server-generated per standard turn semantics). The `tenant_id` is available from the authenticated request context.
+> **turn_id generation for pre-reserve failures**: if no `chat_turns` row exists (failure during validation or authorization before INSERT), the implementation MUST either (1) not emit an outbox event (OPTIONAL branch) or (2) use the **all-zeros sentinel UUID** (`00000000-0000-0000-0000-000000000000`) as the `turn_id` component of the dedupe_key. Using a per-invocation random UUID v4 as `turn_id` is **PROHIBITED**: client retries generate new random UUIDs per attempt, producing a different `dedupe_key` for each retry of the same logical request — defeating idempotency and allowing duplicate pre-reserve events. The sentinel `turn_id` is stable across retries of the same `request_id`. Dedupe key format: `{tenant_id_hex}/00000000000000000000000000000000/{request_id_hex}` (all UUIDs normalized to lowercase 32-char hex). The `request_id` is always available (client-provided or server-generated per standard turn semantics). The `tenant_id` is available from the authenticated request context.
 
 > **Consumer Warning for Optional Pre-Reserve Events**: If the system emits optional outbox events for pre-reserve failures, consumers MUST be aware that:
-> 1. The `turn_id` in the event may be synthetic (not persisted in `chat_turns` table)
+> 1. The `turn_id` in the event is the all-zeros sentinel UUID (`00000000-0000-0000-0000-000000000000`), not a real `chat_turns` row identifier
 > 2. JOIN operations to `chat_turns` by this `turn_id` will fail or return no rows
 > 3. Optional pre-reserve events represent zero billing impact and exist for observability/debugging only
 > 4. Consumers MUST check `settlement_method = "released"` and `usage = { input_tokens: 0, output_tokens: 0 }` to identify these events
