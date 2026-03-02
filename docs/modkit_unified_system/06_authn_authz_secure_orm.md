@@ -14,7 +14,7 @@ For the full architectural design (AuthZEN model, predicate types, caching, depl
 - **Rule**: Fail-closed — denied PDP decisions, unreachable PDP, and missing constraints all result in 403 Forbidden.
 - **Rule**: Map `EnforcerError` to domain errors. Never expose PDP internals to the client.
 - **Rule**: Use `.authenticated()` on `OperationBuilder` for protected endpoints, `.public()` for unauthenticated ones.
-- **Rule**: No plain SQL in handlers/services/repos. Raw SQL is allowed only in migration infrastructure.
+- **Rule**: No plain SQL in handlers/services/repos. Raw SQL is allowed only in migration infrastructure. See [`11_database_patterns.md`](./11_database_patterns.md) for migration rules.
 
 ## Architecture overview
 
@@ -594,54 +594,9 @@ Use these when the base entity cannot be tenant-filtered directly:
 - Must be scoped via `scope_with` / `SecureConn::update_many(scope)`.
 - Attempts to set the `tenant_id` column are denied at runtime (`Denied("tenant_id is immutable")`).
 
-## Executors: `DBRunner` and `SecureTx`
+## Executors, transactions, repository pattern, and migrations
 
-- Repository methods should accept **`runner: &impl DBRunner`**, not `&SecureConn`.
-- Inside a transaction callback, you get **`&SecureTx`**. It also implements `DBRunner`, so the same repository methods work both inside and outside a transaction.
-
-Example signature:
-
-```rust
-use modkit_db::secure::{AccessScope, DBRunner};
-
-pub async fn create_user(
-    runner: &impl DBRunner,
-    scope: &AccessScope,
-    user: user::ActiveModel,
-) -> Result<user::Model, ScopeError> {
-    // ...
-}
-```
-
-## Transactions
-
-### Transaction with SecureConn
-
-`in_transaction_mapped` consumes the `SecureConn` and returns `(SecureConn, Result<T, E>)`, preventing accidental use of the outer connection inside the transaction:
-
-```rust
-pub async fn transfer_user(
-    &self,
-    ctx: &SecurityContext,
-    from_tenant: Uuid,
-    to_tenant: Uuid,
-    user_id: Uuid,
-) -> Result<(), DomainError> {
-    let secure_conn = self.db.sea_secure();
-    let scope = enforcer.access_scope(ctx, &resources::USER, actions::UPDATE, None).await?;
-
-    let (_conn, result) = secure_conn
-        .in_transaction_mapped(DomainError::database_infra, move |tx| {
-            Box::pin(async move {
-                // tx is &SecureTx — use it as the runner for repository calls
-                // repo.transfer_user(tx, &scope, from_tenant, to_tenant, user_id).await?;
-                Ok(())
-            })
-        })
-        .await;
-    result
-}
-```
+See [`11_database_patterns.md`](./11_database_patterns.md) for `DBRunner`/`SecureTx`, transaction patterns (`in_transaction_mapped`), the repository pattern, and database migrations.
 
 ## Error handling
 
@@ -671,106 +626,6 @@ This mapping follows the fail-closed principle: denial and compilation failures 
 ### ScopeError (ORM errors)
 
 `ScopeError` is returned by `SecureConn` / `SecureTx` methods when scope violations occur (e.g., inserting into a tenant not in scope, attempting to change `tenant_id`). Map these to appropriate domain errors (typically 403 for denied, 500 for DB errors).
-
-## Repository pattern
-
-### Repository with `DBRunner` (works with both `SecureConn` and `SecureTx`)
-
-```rust
-use modkit_db::secure::{AccessScope, DBRunner, ScopeError, SecureEntityExt};
-use sea_orm::Set;
-
-pub struct UserRepository;
-
-impl UserRepository {
-    pub async fn find_by_id(
-        &self,
-        runner: &impl DBRunner,
-        scope: &AccessScope,
-        id: Uuid,
-    ) -> Result<Option<user::Model>, ScopeError> {
-        Ok(user::Entity::find_by_id(id)
-            .secure()
-            .scope_with(scope)
-            .one(runner)
-            .await?)
-    }
-
-    pub async fn create(
-        &self,
-        runner: &impl DBRunner,
-        scope: &AccessScope,
-        new_user: user_info_sdk::NewUser,
-    ) -> Result<user::Model, ScopeError> {
-        let am = user::ActiveModel {
-            id: Set(new_user.id.unwrap_or_else(Uuid::new_v4)),
-            tenant_id: Set(new_user.tenant_id),
-            email: Set(new_user.email),
-            display_name: Set(new_user.display_name),
-            ..Default::default()
-        };
-
-        modkit_db::secure::secure_insert::<user::Entity>(am, scope, runner).await
-    }
-}
-```
-
-## Database migrations
-
-Modules provide migration definitions that the runtime executes with a privileged connection:
-
-```rust
-impl DatabaseCapability for MyModule {
-    fn migrations(&self) -> Vec<Box<dyn sea_orm_migration::MigrationTrait>> {
-        use sea_orm_migration::MigratorTrait;
-        crate::infra::storage::migrations::Migrator::migrations()
-    }
-}
-```
-
-Each module gets its own migration history table (`modkit_migrations__<prefix>__<hash8>`), ensuring isolation between modules.
-
-### Migrations use raw SQL
-
-```rust
-use sea_orm_migration::prelude::*;
-
-#[derive(DeriveMigrationName)]
-pub struct Migration;
-
-#[async_trait::async_trait]
-impl MigrationTrait for Migration {
-    async fn up(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .create_table(
-                Table::create()
-                    .table(Users::Table)
-                    .if_not_exists()
-                    .col(ColumnDef::new(Users::Id).uuid().not_null().primary_key())
-                    .col(ColumnDef::new(Users::TenantId).uuid().not_null())
-                    .col(ColumnDef::new(Users::Email).string().not_null())
-                    .to_owned(),
-            )
-            .await
-    }
-
-    async fn down(&self, manager: &SchemaManager) -> Result<(), DbErr> {
-        manager
-            .drop_table(Table::drop().table(Users::Table).to_owned())
-            .await
-    }
-}
-
-#[derive(DeriveIden)]
-enum Users {
-    Table,
-    Id,
-    TenantId,
-    Email,
-}
-```
-
-Raw SQL is **allowed only in migration infrastructure** (migration runner + migration definitions). Module code (handlers/services/repos) must use the Secure ORM.
 
 ## Development setup
 
@@ -855,8 +710,7 @@ In tests, build scopes explicitly (`AccessScope::for_tenant(...)`, `AccessScope:
 - [ ] Pass the `AccessScope` from `PolicyEnforcer` to `SecureConn` methods.
 - [ ] Use `secure_conn.find::<Entity>(&scope).all(&secure_conn)` for auto-scoped queries.
 - [ ] Use `secure_conn.update_with_ctx::<Entity>(&scope, id, am)` for single-record updates.
-- [ ] Use raw SQL only in `migrations/*.rs`.
-- [ ] Add indexes on security columns (tenant_id, resource_id).
+- [ ] See [`11_database_patterns.md`](./11_database_patterns.md) for DBRunner, transaction, repository, and migration checklists.
 
 ### CRUD patterns
 - [ ] Use prefetch pattern for GET/UPDATE/DELETE (extract `owner_tenant_id` for narrow PDP constraints).
@@ -867,6 +721,7 @@ In tests, build scopes explicitly (`AccessScope::for_tenant(...)`, `AccessScope:
 
 - Full authorization architecture: [`docs/arch/authorization/DESIGN.md`](../arch/authorization/DESIGN.md)
 - Usage scenarios: [`docs/arch/authorization/AUTHZ_USAGE_SCENARIOS.md`](../arch/authorization/AUTHZ_USAGE_SCENARIOS.md)
+- Database execution patterns (DBRunner, transactions, repos, migrations): [`11_database_patterns.md`](./11_database_patterns.md)
 - REST OperationBuilder (`.authenticated()`, `.public()`): [`04_rest_operation_builder.md`](./04_rest_operation_builder.md)
 - OData pagination / filtering: [`07_odata_pagination_select_filter.md`](./07_odata_pagination_select_filter.md)
 - Canonical example: `examples/modkit/users-info/users-info/src/`

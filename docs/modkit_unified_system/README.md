@@ -11,8 +11,9 @@ This folder contains the ModKit developer documentation, split by topic for focu
 
 | Task / Goal | Primary file(s) to read | Related external docs |
 |-------------|------------------------|----------------------|
-| Adding a new module | `02_module_layout_and_sdk_pattern.md` | `guidelines/NEW_MODULE.md` |
-| DB/persistence, SecureConn, AccessScope | `06_authn_authz_secure_orm.md` | |
+| Adding a new module | `02_module_layout_and_sdk_pattern.md` | |
+| Authentication, Authorization, SecureConn, AccessScope | `06_authn_authz_secure_orm.md` | |
+| DB execution (transactions, migrations, repos) | `11_database_patterns.md` | |
 | REST endpoint wiring, OperationBuilder | `04_rest_operation_builder.md` | |
 | OData, $select, pagination, filtering | `07_odata_pagination_select_filter.md` | |
 | ClientHub, inter-module clients | `03_clienthub_and_plugins.md` | |
@@ -51,6 +52,7 @@ This folder contains the ModKit developer documentation, split by topic for focu
 - `08_lifecycle_stateful_tasks.md` – WithLifecycle, cancellation tokens, stateful module patterns.
 - `09_oop_grpc_sdk_pattern.md` – Out-of-Process modules, gRPC, SDK pattern for OoP, client utilities.
 - `10_checklists_and_templates.md` – Quick checklists per task, minimal code templates.
+- `11_database_patterns.md` – DBRunner/SecureTx executors, transactions, repository pattern, database migrations.
 
 ### Related ADRs
 
