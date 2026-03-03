@@ -9,18 +9,14 @@ use super::DbProvider;
 
 /// Service handling quota tracking and enforcement.
 #[domain_model]
-pub struct QuotaService {
+pub struct QuotaService<QR: QuotaUsageRepository> {
     _db: Arc<DbProvider>,
-    _repo: Arc<dyn QuotaUsageRepository>,
+    _repo: Arc<QR>,
     _enforcer: PolicyEnforcer,
 }
 
-impl QuotaService {
-    pub(crate) fn new(
-        db: Arc<DbProvider>,
-        repo: Arc<dyn QuotaUsageRepository>,
-        enforcer: PolicyEnforcer,
-    ) -> Self {
+impl<QR: QuotaUsageRepository> QuotaService<QR> {
+    pub(crate) fn new(db: Arc<DbProvider>, repo: Arc<QR>, enforcer: PolicyEnforcer) -> Self {
         Self {
             _db: db,
             _repo: repo,

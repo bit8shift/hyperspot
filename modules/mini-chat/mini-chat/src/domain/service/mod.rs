@@ -5,11 +5,13 @@ use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
 use modkit_db::DBProvider;
 use modkit_macros::domain_model;
 
+use crate::config::StreamingConfig;
 use crate::domain::repos::{
     AttachmentRepository, ChatRepository, MessageRepository, ModelPrefRepository,
     QuotaUsageRepository, ReactionRepository, ThreadSummaryRepository, TurnRepository,
     VectorStoreRepository,
 };
+use crate::infra::llm::LlmProvider;
 
 mod attachment_service;
 mod chat_service;
@@ -23,7 +25,7 @@ pub(crate) use chat_service::ChatService;
 pub(crate) use model_service::ModelService;
 pub(crate) use quota_service::QuotaService;
 pub(crate) use reaction_service::ReactionService;
-pub(crate) use stream_service::StreamService;
+pub(crate) use stream_service::{StreamError, StreamService};
 
 pub(crate) type DbProvider = DBProvider<modkit_db::DbError>;
 
@@ -64,12 +66,17 @@ pub(crate) mod actions {
 
 /// All repository instances passed to `AppServices::new` as a single bundle.
 #[domain_model]
-pub(crate) struct Repositories {
-    pub(crate) chat: Arc<dyn ChatRepository>,
+pub(crate) struct Repositories<
+    TR: TurnRepository,
+    MR: MessageRepository,
+    QR: QuotaUsageRepository,
+    CR: ChatRepository,
+> {
+    pub(crate) chat: Arc<CR>,
     pub(crate) attachment: Arc<dyn AttachmentRepository>,
-    pub(crate) message: Arc<dyn MessageRepository>,
-    pub(crate) quota: Arc<dyn QuotaUsageRepository>,
-    pub(crate) turn: Arc<dyn TurnRepository>,
+    pub(crate) message: Arc<MR>,
+    pub(crate) quota: Arc<QR>,
+    pub(crate) turn: Arc<TR>,
     pub(crate) reaction: Arc<dyn ReactionRepository>,
     pub(crate) model_pref: Arc<dyn ModelPrefRepository>,
     pub(crate) thread_summary: Arc<dyn ThreadSummaryRepository>,
@@ -83,20 +90,33 @@ pub(crate) struct Repositories {
 /// handlers call service methods with business parameters only.
 #[domain_model]
 #[allow(dead_code)]
-pub(crate) struct AppServices {
-    pub(crate) chats: ChatService,
-    pub(crate) stream: StreamService,
-    pub(crate) reactions: ReactionService,
-    pub(crate) attachments: AttachmentService,
+pub(crate) struct AppServices<
+    TR: TurnRepository + 'static,
+    MR: MessageRepository + 'static,
+    QR: QuotaUsageRepository + 'static,
+    CR: ChatRepository + 'static,
+> {
+    pub(crate) chats: ChatService<MR, CR>,
+    pub(crate) stream: StreamService<TR, MR, CR>,
+    pub(crate) reactions: ReactionService<MR, CR>,
+    pub(crate) attachments: AttachmentService<CR>,
     pub(crate) models: ModelService,
-    pub(crate) quota: QuotaService,
+    pub(crate) quota: QuotaService<QR>,
 }
 
-impl AppServices {
+impl<
+    TR: TurnRepository + 'static,
+    MR: MessageRepository + 'static,
+    QR: QuotaUsageRepository + 'static,
+    CR: ChatRepository + 'static,
+> AppServices<TR, MR, QR, CR>
+{
     pub(crate) fn new(
-        repos: &Repositories,
+        repos: &Repositories<TR, MR, QR, CR>,
         db: Arc<DbProvider>,
         authz: Arc<dyn AuthZResolverClient>,
+        llm: Arc<dyn LlmProvider>,
+        streaming_config: StreamingConfig,
     ) -> Self {
         let enforcer = PolicyEnforcer::new(authz);
 
@@ -114,6 +134,8 @@ impl AppServices {
                 Arc::clone(&repos.message),
                 Arc::clone(&repos.chat),
                 enforcer.clone(),
+                llm,
+                streaming_config,
             ),
             reactions: ReactionService::new(
                 Arc::clone(&db),

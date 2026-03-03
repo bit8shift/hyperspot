@@ -11,7 +11,7 @@ use axum::Router;
 use modkit::api::OpenApiRegistry;
 use modkit::api::operation_builder::LicenseFeature;
 
-use crate::domain::service::AppServices;
+use crate::module::AppServices;
 
 /// License feature required by all mini-chat endpoints.
 ///

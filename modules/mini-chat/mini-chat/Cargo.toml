@@ -20,12 +20,22 @@ mini-chat-sdk = { package = "cf-mini-chat-sdk", path = "../mini-chat-sdk" }
 # AuthZ resolver for authorization (PEP flow)
 authz-resolver-sdk = { package = "cf-authz-resolver-sdk", path = "../../system/authz-resolver/authz-resolver-sdk" }
 
+# OAGW SDK — proxy calls, SSE stream, gateway errors
+oagw-sdk = { package = "cf-oagw-sdk", path = "../../system/oagw/oagw-sdk" }
+
 # Core dependencies
 anyhow = { workspace = true }
 async-trait = { workspace = true }
 tokio = { workspace = true }
 tracing = { workspace = true }
 inventory = { workspace = true }
+
+# Streaming / async utilities
+tokio-util = { workspace = true }
+pin-project-lite = { workspace = true }
+futures = { workspace = true }
+bytes = { workspace = true }
+regex = { workspace = true }
 
 # Serde and JSON
 serde = { workspace = true }

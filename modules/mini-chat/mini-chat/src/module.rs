@@ -4,11 +4,15 @@ use async_trait::async_trait;
 use authz_resolver_sdk::AuthZResolverClient;
 use modkit::api::OpenApiRegistry;
 use modkit::{DatabaseCapability, Module, ModuleCtx, RestApiCapability};
+use oagw_sdk::ServiceGatewayClientV1;
 use sea_orm_migration::MigrationTrait;
 use tracing::info;
 
 use crate::api::rest::routes;
-use crate::domain::service::{AppServices, Repositories};
+use crate::domain::service::{AppServices as GenericAppServices, Repositories};
+
+pub(crate) type AppServices =
+    GenericAppServices<TurnRepository, MessageRepository, QuotaUsageRepository, ChatRepository>;
 use crate::infra::db::repo::attachment_repo::AttachmentRepository;
 use crate::infra::db::repo::chat_repo::ChatRepository;
 use crate::infra::db::repo::message_repo::MessageRepository;
@@ -18,6 +22,7 @@ use crate::infra::db::repo::reaction_repo::ReactionRepository;
 use crate::infra::db::repo::thread_summary_repo::ThreadSummaryRepository;
 use crate::infra::db::repo::turn_repo::TurnRepository;
 use crate::infra::db::repo::vector_store_repo::VectorStoreRepository;
+use crate::infra::llm::providers::{ProviderConfig, ProviderKind, create_provider};
 
 /// Default URL prefix for all mini-chat REST routes.
 pub const DEFAULT_URL_PREFIX: &str = "/mini-chat";
@@ -48,6 +53,10 @@ impl Module for MiniChatModule {
         info!("Initializing {} module", Self::MODULE_NAME);
 
         let cfg: crate::config::MiniChatConfig = ctx.config()?;
+        cfg.streaming
+            .validate()
+            .map_err(|e| anyhow::anyhow!("streaming config: {e}"))?;
+
         self.url_prefix
             .set(cfg.url_prefix)
             .map_err(|_| anyhow::anyhow!("{} url_prefix already set", Self::MODULE_NAME))?;
@@ -58,6 +67,21 @@ impl Module for MiniChatModule {
             .client_hub()
             .get::<dyn AuthZResolverClient>()
             .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
+
+        let gateway = ctx
+            .client_hub()
+            .get::<dyn ServiceGatewayClientV1>()
+            .map_err(|e| anyhow::anyhow!("failed to get OAGW gateway: {e}"))?;
+
+        // TODO: provider kind and upstream alias should come from config in a
+        // follow-up — hardcoded to OpenAI Responses for initial P1 wiring.
+        let llm = create_provider(
+            gateway,
+            ProviderConfig {
+                kind: ProviderKind::OpenAiResponses,
+                upstream_alias: "openai".to_owned(),
+            },
+        );
 
         let repos = Repositories {
             chat: Arc::new(ChatRepository),
@@ -71,7 +95,7 @@ impl Module for MiniChatModule {
             vector_store: Arc::new(VectorStoreRepository),
         };
 
-        let services = Arc::new(AppServices::new(&repos, db, authz));
+        let services = Arc::new(AppServices::new(&repos, db, authz, llm, cfg.streaming));
 
         self.service
             .set(services)

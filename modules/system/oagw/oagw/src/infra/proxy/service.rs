@@ -320,6 +320,17 @@ impl DataPlaneService for DataPlaneServiceImpl {
 
         // 9. Build streaming response.
         let status = response.status();
+        let content_type = response
+            .headers()
+            .get(http::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .unwrap_or("<none>");
+        tracing::debug!(
+            %status,
+            content_type,
+            upstream_url = %url,
+            "upstream response received"
+        );
         let mut resp_headers = response.headers().clone();
         headers::sanitize_response_headers(&mut resp_headers);
 

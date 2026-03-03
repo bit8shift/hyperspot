@@ -9,19 +9,19 @@ use super::DbProvider;
 
 /// Service handling chat CRUD and message listing operations.
 #[domain_model]
-pub struct ChatService {
+pub struct ChatService<MR: MessageRepository, CR: ChatRepository> {
     _db: Arc<DbProvider>,
-    _chat_repo: Arc<dyn ChatRepository>,
-    _message_repo: Arc<dyn MessageRepository>,
+    _chat_repo: Arc<CR>,
+    _message_repo: Arc<MR>,
     _thread_summary_repo: Arc<dyn ThreadSummaryRepository>,
     _enforcer: PolicyEnforcer,
 }
 
-impl ChatService {
+impl<MR: MessageRepository, CR: ChatRepository> ChatService<MR, CR> {
     pub(crate) fn new(
         db: Arc<DbProvider>,
-        chat_repo: Arc<dyn ChatRepository>,
-        message_repo: Arc<dyn MessageRepository>,
+        chat_repo: Arc<CR>,
+        message_repo: Arc<MR>,
         thread_summary_repo: Arc<dyn ThreadSummaryRepository>,
         enforcer: PolicyEnforcer,
     ) -> Self {

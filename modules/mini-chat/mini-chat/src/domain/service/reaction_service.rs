@@ -9,20 +9,20 @@ use super::DbProvider;
 
 /// Service handling message reaction operations.
 #[domain_model]
-pub struct ReactionService {
+pub struct ReactionService<MR: MessageRepository, CR: ChatRepository> {
     _db: Arc<DbProvider>,
     _reaction_repo: Arc<dyn ReactionRepository>,
-    _message_repo: Arc<dyn MessageRepository>,
-    _chat_repo: Arc<dyn ChatRepository>,
+    _message_repo: Arc<MR>,
+    _chat_repo: Arc<CR>,
     _enforcer: PolicyEnforcer,
 }
 
-impl ReactionService {
+impl<MR: MessageRepository, CR: ChatRepository> ReactionService<MR, CR> {
     pub(crate) fn new(
         db: Arc<DbProvider>,
         reaction_repo: Arc<dyn ReactionRepository>,
-        message_repo: Arc<dyn MessageRepository>,
-        chat_repo: Arc<dyn ChatRepository>,
+        message_repo: Arc<MR>,
+        chat_repo: Arc<CR>,
         enforcer: PolicyEnforcer,
     ) -> Self {
         Self {

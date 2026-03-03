@@ -1,11 +1,24 @@
+use std::convert::Infallible;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::{Context, Poll};
+use std::time::Duration;
 
-use axum::Extension;
 use axum::extract::Path;
+use axum::response::sse::{Event, KeepAlive, Sse};
+use axum::response::{IntoResponse, Response};
+use axum::{Extension, Json};
+use futures::Stream;
 use modkit::api::prelude::*;
 use modkit_security::SecurityContext;
+use tokio::sync::mpsc;
+use tokio::time::{Interval, interval};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, info, warn};
 
-use crate::domain::service::AppServices;
+use crate::api::rest::dto::{StreamEvent, StreamEventKind, StreamMessageRequest, StreamPhase};
+use crate::domain::service::StreamError;
+use crate::module::AppServices;
 
 use super::not_implemented;
 
@@ -19,10 +32,228 @@ pub(crate) async fn list_messages(
 }
 
 /// POST /mini-chat/v1/chats/{id}/messages/stream
+///
+/// Pre-stream validation returns JSON errors. On success, opens an SSE
+/// connection and relays events from the provider through a bounded channel.
 pub(crate) async fn stream_message(
-    Extension(_ctx): Extension<SecurityContext>,
-    Extension(_svc): Extension<Arc<AppServices>>,
-    Path(_chat_id): Path<uuid::Uuid>,
-) -> ApiResult<StatusCode> {
-    Err(not_implemented())
+    Extension(ctx): Extension<SecurityContext>,
+    Extension(svc): Extension<Arc<AppServices>>,
+    Path(chat_id): Path<uuid::Uuid>,
+    Json(body): Json<StreamMessageRequest>,
+) -> Response {
+    // ── Pre-stream validation ──────────────────────────────────────────
+    if body.content.trim().is_empty() {
+        return Problem::new(
+            StatusCode::BAD_REQUEST,
+            "Bad Request",
+            "Message content must not be empty",
+        )
+        .into_response();
+    }
+
+    // TODO P1: AuthZ (PolicyEnforcer::evaluate with send_message action)
+    // TODO P1: Chat existence check via AccessScope
+
+    // ── Wire up streaming pipeline ─────────────────────────────────────
+    let capacity = svc.stream.channel_capacity();
+    let ping_secs = svc.stream.ping_interval_secs();
+    let (tx, rx) = mpsc::channel::<StreamEvent>(capacity);
+    let cancel = CancellationToken::new();
+
+    // TODO: model should come from user preferences / quota decision
+    let model = "gpt-4o".to_owned();
+    let request_id = body.request_id.unwrap_or_else(uuid::Uuid::new_v4);
+
+    info!(chat_id = %chat_id, %request_id, model = %model, "starting SSE stream");
+
+    // Pre-stream checks + spawn the provider task
+    let provider_handle = match svc
+        .stream
+        .run_stream(
+            ctx,
+            chat_id,
+            request_id,
+            body.content,
+            model,
+            cancel.clone(),
+            tx,
+        )
+        .await
+    {
+        Ok(handle) => handle,
+        Err(StreamError::Replay { .. }) => {
+            return Problem::new(StatusCode::CONFLICT, "Conflict", "Duplicate request_id")
+                .into_response();
+        }
+        Err(StreamError::Conflict { message, .. }) => {
+            return Problem::new(StatusCode::CONFLICT, "Conflict", &message).into_response();
+        }
+        Err(StreamError::TurnCreationFailed { source }) => {
+            warn!(error = %source, "pre-stream turn creation failed");
+            return Problem::new(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "Internal Error",
+                "Failed to initialize turn",
+            )
+            .into_response();
+        }
+    };
+
+    // Monitor provider task for panics
+    tokio::spawn(async move {
+        if let Err(e) = provider_handle.await {
+            tracing::error!(error = ?e, "provider task panicked");
+        }
+    });
+
+    // Build the SSE relay stream
+    let relay = SseRelay::new(rx, cancel, ping_secs);
+
+    Sse::new(relay)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(30)))
+        .into_response()
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+// SseRelay — handler-side relay loop as a Stream
+// ════════════════════════════════════════════════════════════════════════════
+
+/// SSE relay that reads from the provider channel, enforces event ordering,
+/// emits ping keepalives, and respects cancellation.
+///
+/// Implements `Stream<Item = Result<Event, Infallible>>` for Axum SSE.
+struct SseRelay {
+    rx: mpsc::Receiver<StreamEvent>,
+    cancel: CancellationToken,
+    phase: StreamPhase,
+    ping_timer: Interval,
+    done: bool,
+    /// TODO: will be used for disconnect-stage reporting
+    first_delta_emitted: bool,
+}
+
+impl SseRelay {
+    fn new(rx: mpsc::Receiver<StreamEvent>, cancel: CancellationToken, ping_secs: u64) -> Self {
+        Self {
+            rx,
+            cancel,
+            phase: StreamPhase::Idle,
+            ping_timer: interval(Duration::from_secs(ping_secs)),
+            done: false,
+            first_delta_emitted: false,
+        }
+    }
+}
+
+impl Drop for SseRelay {
+    fn drop(&mut self) {
+        self.cancel.cancel();
+    }
+}
+
+impl Stream for SseRelay {
+    type Item = Result<Event, Infallible>;
+
+    #[allow(clippy::cognitive_complexity)]
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+
+        if this.done {
+            return Poll::Ready(None);
+        }
+
+        // Check cancellation
+        if this.cancel.is_cancelled() {
+            this.done = true;
+            return Poll::Ready(None);
+        }
+
+        // Try to receive an event from the channel (non-blocking poll)
+        match this.rx.poll_recv(cx) {
+            Poll::Ready(Some(event)) => {
+                let kind = event.event_kind();
+                let is_terminal = event.is_terminal();
+
+                // Enforce ordering via StreamPhase
+                match this.phase.try_advance(kind) {
+                    Ok(new_phase) => {
+                        this.phase = new_phase;
+                    }
+                    Err(violation) => {
+                        warn!(%violation, "suppressing out-of-order SSE event");
+                        // Wake immediately to try next event
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                }
+
+                // Track first delta for disconnect stage reporting
+                if kind == StreamEventKind::Delta {
+                    this.first_delta_emitted = true;
+                }
+
+                // Convert to SSE Event
+                let sse_event = match event.into_sse_event() {
+                    Ok(e) => e,
+                    Err(e) => {
+                        warn!(error = %e, "failed to serialize SSE event");
+                        cx.waker().wake_by_ref();
+                        return Poll::Pending;
+                    }
+                };
+
+                // Terminal events end the stream
+                if is_terminal {
+                    this.done = true;
+                }
+
+                // Reset ping timer on any event
+                this.ping_timer.reset();
+
+                Poll::Ready(Some(Ok(sse_event)))
+            }
+            Poll::Ready(None) => {
+                // Channel closed — provider task exited
+                debug!("provider channel closed");
+                this.done = true;
+
+                // If no terminal event was received, emit an error to honour
+                // the SSE contract (streams must end with done or error).
+                if !this.phase.is_terminal() {
+                    let error_event = StreamEvent::Error(crate::api::rest::dto::ErrorData {
+                        code: "stream_interrupted".to_owned(),
+                        message: "Provider stream ended unexpectedly".to_owned(),
+                    });
+                    if let Ok(sse) = error_event.into_sse_event() {
+                        return Poll::Ready(Some(Ok(sse)));
+                    }
+                }
+
+                Poll::Ready(None)
+            }
+            Poll::Pending => {
+                // No event ready — check if ping timer fired
+                if this.ping_timer.poll_tick(cx).is_ready() {
+                    // Only emit pings in Idle or Pinging phase
+                    let kind = StreamEventKind::Ping;
+                    match this.phase.try_advance(kind) {
+                        Ok(new_phase) => {
+                            this.phase = new_phase;
+                            #[allow(clippy::expect_used)]
+                            let ping = StreamEvent::Ping
+                                .into_sse_event()
+                                .expect("ping serialization cannot fail");
+                            Poll::Ready(Some(Ok(ping)))
+                        }
+                        Err(_) => {
+                            // Past pinging phase — skip the ping silently
+                            Poll::Pending
+                        }
+                    }
+                } else {
+                    Poll::Pending
+                }
+            }
+        }
+    }
 }
