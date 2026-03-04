@@ -84,7 +84,7 @@ gts.cf.core.errors.err.v1~cf.core.err.{category}.v1~
 └────── base type ──────┘ └───── instance type ────┘
 ```
 
-The base type `gts.cf.core.errors.err.v1` identifies "canonical error." The instance type `cf.core.err.{category}.v1` identifies the specific category. The `~` separator is part of GTS compound type syntax.
+The base type `gts.cf.core.errors.err.v1~` identifies "canonical error." The instance type `cf.core.err.{category}.v1~` identifies the specific category.
 
 All 16 identifiers are defined as `const` values in the `CanonicalError` implementation. See [DESIGN.md](../DESIGN.md) § Category Reference.
 
