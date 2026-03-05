@@ -183,9 +183,13 @@ mod tests {
     }
 
     #[test]
-    fn from_config_with_empty_secrets_initializes() {
+    fn from_config_with_empty_secrets_returns_none_for_any_lookup() {
         let cfg = StaticCredStorePluginConfig::default();
-        let service = Service::from_config(&cfg);
-        assert!(service.is_ok());
+        let service = Service::from_config(&cfg).unwrap();
+        let key = SecretRef::new("any-key").unwrap();
+        assert!(
+            service.get(tenant_a(), &key).is_none(),
+            "empty config must return None for any lookup"
+        );
     }
 }
