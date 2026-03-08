@@ -1052,7 +1052,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "de0205_operation_builder_tag"
+name = "de0205_operation_builder"
 version = "0.1.0"
 dependencies = [
  "cf-modkit",

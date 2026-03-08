@@ -6,7 +6,7 @@ LL |     let _ = router1.tag("simple resource registry");  // lowercase words
    |
    = help: tags must contain whitespace-separated words, each starting with a capital letter
    = note: example: "User Management", "Simple Resource Registry"
-   = note: `#[deny(de0205_operation_builder_tag)]` on by default
+   = note: `#[deny(de0205_operation_builder)]` on by default
 
 error: tag format is invalid
   --> $DIR/invalid_tag_format.rs:16:25

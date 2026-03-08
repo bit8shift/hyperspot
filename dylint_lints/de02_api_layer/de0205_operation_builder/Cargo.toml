@@ -1,8 +1,8 @@
 [package]
-name = "de0205_operation_builder_tag"
+name = "de0205_operation_builder"
 version = "0.1.0"
 authors = ["Cyber Fabric"]
-description = "Requires operation builders to have a tag with proper format (DE0205)"
+description = "Requires operation builders to have tag and summary (DE0205)"
 edition.workspace = true
 publish = false
 
@@ -18,8 +18,8 @@ name = "invalid_tag_format"
 path = "ui/invalid_tag_format.rs"
 
 [[example]]
-name = "valid_tag"
-path = "ui/valid_tag.rs"
+name = "valid_operation"
+path = "ui/valid_operation.rs"
 
 [dependencies]
 clippy_utils.workspace = true
