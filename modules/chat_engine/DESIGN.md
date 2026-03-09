@@ -6,16 +6,16 @@ Updated:  2026-03-06 by Constructor Tech
 
 ### 1.1 Architectural Vision
 
-Chat Engine is designed as a **CyberFabric ModKit Gateway module** that decouples conversational infrastructure from message processing logic. The system follows a **hub-and-spoke architecture** where Chat Engine acts as the central hub managing session state, message history, and routing, while Backend Plugin modules serve as spokes implementing custom message processing logic.
+Chat Engine is designed as a service that decouples conversational infrastructure from message processing logic. The system follows a **hub-and-spoke architecture** where Chat Engine acts as the central hub managing session state, message history, and routing, while Backend Plugin modules serve as spokes implementing custom message processing logic.
 
 The architecture emphasizes **separation of concerns**: Chat Engine handles persistence, routing, and message tree management, while backend plugins focus solely on message processing. This enables flexible experimentation with different backend implementations, processing strategies, and conversation patterns without requiring changes to client applications or infrastructure.
 
 **Key architectural decisions:**
 - **Message Tree Structure**: Messages form an immutable tree structure enabling conversation branching and variant preservation
 - **Streaming-First**: All plugin responses stream through Chat Engine to clients with minimal latency overhead
-- **Plugin-Driven Capabilities**: Session capabilities are dynamically determined by backend plugins via `on_session_created()`, not hardcoded in Chat Engine
+- **Plugin-Driven Capabilities**: Session capabilities are provided by backend plugins via `on_session_type_configured()`, not hardcoded in Chat Engine
 - **Stateless Routing**: Chat Engine instances can scale horizontally as all session state is persisted in the database
-- **Plugin System**: Backend plugins registered in `types-registry` and resolved at runtime via `ClientHub`; external HTTP backends supported through the `chat-engine-webhook-adapter` plugin (ADR-0026)
+- **Plugin System**: Backend plugins are internal code modules implementing `ChatEngineBackendPlugin` trait; each plugin is referenced by `plugin_instance_id` in session type config (ADR-0026)
 
 The system supports both **linear conversations** (traditional chat) and **non-linear conversations** (branching, variants, regeneration), enabling advanced use cases like conversation exploration, A/B testing of different backends, and human-in-the-loop workflows.
 
@@ -88,9 +88,9 @@ Once a message is created with a parent_message_id, that relationship is immutab
 - [ ] `p1` - **ID**: `cpt-chat-engine-principle-backend-authority`
 
 <!-- fdd-id-content -->
-**ADRs**: ADR-0002, ADR-0026
+**ADRs**: `cpt-chat-engine-adr-capability-model` (ADR-0002), `cpt-chat-engine-adr-plugin-backend-integration` (ADR-0026), `cpt-chat-engine-adr-llm-gateway-plugin` (ADR-0027)
 
-Backend plugins are authoritative for session capabilities and message processing logic. Chat Engine does not interpret or validate capability semantics — it only stores and forwards them. Capabilities are typed (`bool`, `enum`, `str`, `int`): `SessionType.available_capabilities` is the maximum set the plugin can provide; `Session.enabled_capabilities` is the subset confirmed for a specific session. Per-message capability settings are passed as `CapabilityValue[]` (id + value). This allows backend plugins to evolve independently without Chat Engine changes. Plugin authors may internally delegate to external HTTP services (e.g., via `chat-engine-webhook-adapter`) without affecting Chat Engine.
+Backend plugins are code modules inside Chat Engine implementing the `ChatEngineBackendPlugin` trait. A session type references its plugin via `plugin_instance_id`. On `on_session_type_configured`, the plugin returns `Vec<Capability>` stored as `SessionType.available_capabilities`. On each message operation, Chat Engine calls the corresponding trait method and receives a `ResponseStream`. Plugins own all outbound communication — for example, the LLM gateway plugin makes HTTP requests to the LLM gateway service. Chat Engine does not interpret capability semantics, transport details, or external service protocols. Plugins may extend `SessionType.metadata` and `Message.metadata` with typed fields by registering GTS derived schemas — see `cpt-chat-engine-adr-llm-gateway-plugin`.
 <!-- fdd-id-content -->
 
 #### Principle: Stream Everything
@@ -216,7 +216,7 @@ All Chat Engine instances share a single database cluster. No local caching of s
 
 - **Session** - Session entity (session_id, client_id, user_id, tenant_id, session_type_id, enabled_capabilities, metadata, created_at, updated_at, share_token)
 - **Message** - Message entity (message_id, session_id, parent_message_id, role, content, file_ids, variant_index, is_active, is_complete, metadata, created_at)
-- **SessionType** - Session type config (session_type_id, name, plugin_instance_id, summarization_settings, meta, created_at, updated_at)
+- **SessionType** - Binding of a plugin and its configuration (session_type_id, name, plugin_instance_id, available_capabilities, metadata, retention_policy)
 - **Capability** - Typed capability definition (id, name, type: `bool|enum|str|int`, default_value, enum_values when type=enum)
 - **CapabilityValue** - Per-message capability setting (id, value: boolean|string|integer)
 - **ContentPart** - Abstract content type (type, ...)
@@ -333,9 +333,9 @@ Chat Engine orchestrates message creation, persistence, and tree management. It 
 <!-- fdd-id-content -->
 **ADRs**: ADR-0004 (zero business logic), ADR-0026 (plugin system)
 
-Chat Engine's plugin invocation layer. Resolves `dyn ChatEngineBackendPlugin` from `ClientHub` by `plugin_instance_id`, constructs call context, and invokes plugin methods (`on_session_created`, `on_message`, `on_message_recreate`, `on_session_summary`). Auth, retry, circuit breaker, and timeouts are the plugin's responsibility; the `chat-engine-webhook-adapter` plugin provides these for external HTTP backends.
+Chat Engine's plugin invocation layer. Resolves `dyn ChatEngineBackendPlugin` by `plugin_instance_id`, constructs call context, and invokes plugin methods (`on_session_type_configured`, `on_session_created`, `on_message`, `on_message_recreate`, `on_session_summary`). Auth, retry, circuit breaker, and timeouts are the plugin's responsibility.
 
-**N:1 session type → plugin relationship**: Multiple differently-configured session types can share the same `plugin_instance_id`. The call context always includes `session_type_id` and `session_type_meta` (the `meta` JSON blob from the `session_types` table), allowing a single plugin instance to serve multiple session types with different behaviour (e.g., different configuration, different capability set, different processing strategy).
+**N:1 session type → plugin relationship**: Multiple differently-configured session types can share the same `plugin_instance_id`. The call context always includes `session_type_id` and `session_type_metadata` (the `metadata` JSON blob from the `session_types` table), allowing a single plugin instance to serve multiple session types with different behaviour (e.g., different configuration, different capability set, different processing strategy).
 <!-- fdd-id-content -->
 
 #### Response Streaming
@@ -379,7 +379,7 @@ Chat Engine allows users to react to messages with simple like/dislike feedback.
 
 **Key Interactions**:
 - Client → Chat Engine: Session and message operations via HTTP REST API
-- Chat Engine → Backend Plugin: `ClientHub` trait call with context (in-process or via `chat-engine-webhook-adapter`)
+- Chat Engine → Backend Plugin: internal trait call with context (in-process)
 - Chat Engine → Client: HTTP chunked streaming with NDJSON messages
 - Chat Engine → File Storage: File upload with signed URL generation for exports
 - Chat Engine → Database: All persistence operations for sessions, messages, and metadata
@@ -472,10 +472,11 @@ For complete endpoint definitions, request/response schemas, and examples, see t
 
 **Interface**: `dyn ChatEngineBackendPlugin` (Rust trait, `chat-engine-sdk` crate)
 
-**Discovery**: Plugin instances registered in `types-registry` with GTS ID `gts.x.core.modkit.plugin.v1~x.chat_engine.backend.plugin.v1~{instance}`; resolved at runtime via `ClientHub::get_scoped`.
+**Discovery**: Plugin implementations are internal code modules registered in Chat Engine's plugin registry at startup by `plugin_instance_id`.
 
 **Plugin methods**:
-- `on_session_created(ctx)` → `Capability[]` (`enabled_capabilities`) — typed capability definitions confirmed for this session
+- `on_session_type_configured(ctx)` → `Vec<Capability>` — capabilities stored as `SessionType.available_capabilities`
+- `on_session_created(ctx)` — establishes per-session plugin state
 - `on_message(ctx, stream)` → streams response chunks
 - `on_message_recreate(ctx, stream)` → streams regenerated response
 - `on_session_summary(ctx, stream)` → streams session summary
@@ -483,17 +484,15 @@ For complete endpoint definitions, request/response schemas, and examples, see t
 
 **Streaming**: Plugin writes chunks to `ResponseStream`; Chat Engine pipes to client via HTTP chunked transfer (NDJSON)
 
-**External HTTP backends**: Use `chat-engine-webhook-adapter` plugin (implements `dyn ChatEngineBackendPlugin`, internally manages auth, retry, circuit breaker, and timeout per `webhook-protocol.json`). See ADR-0026.
 
 ### Internal Dependencies
 
-Chat Engine is a **ModKit Gateway module** and depends on the following internal platform modules at runtime.
+Chat Engine depends on the following internal modules at runtime.
 
 | Dependency Module | Interface Used | Purpose |
 |-------------------|----------------|---------|
-| `types-registry` | ModKit registry API | Discover registered `ChatEngineBackendPlugin` instances by `plugin_instance_id` at startup and validate plugin registration on session type configuration |
-| `ClientHub` | `hub.get_scoped::<dyn ChatEngineBackendPlugin>(&scope)` | Resolve and call backend plugin implementations at request time; scope key is `ClientScope::gts_id(&plugin_instance_id)` |
-| Backend Plugin modules | `dyn ChatEngineBackendPlugin` (chat-engine-sdk) | Process messages, return capabilities on session creation, generate summaries — registered by plugin at `init()` |
+| Plugin Registry | Internal registry | Resolve `ChatEngineBackendPlugin` implementations by `plugin_instance_id` at startup and on session type configuration |
+| Backend Plugin modules | `dyn ChatEngineBackendPlugin` (chat-engine-sdk) | Internal trait implementations that process messages, provide capabilities, and generate summaries |
 
 ### External Dependencies
 
@@ -518,7 +517,7 @@ sequenceDiagram
     participant Backend Plugin
 
     Admin->>Chat Engine: Submit Session Type Config (plugin_instance_id)
-    Chat Engine->>Chat Engine: Validate plugin_instance_id via ClientHub
+    Chat Engine->>Chat Engine: Resolve plugin by plugin_instance_id
 
     opt Plugin health check enabled
         Chat Engine->>Backend Plugin: health_check()
@@ -1025,9 +1024,9 @@ sequenceDiagram
 |--------|------|-------------|
 | session_type_id | UUID PK | Unique session type identifier |
 | name | VARCHAR | Human-readable name |
-| plugin_instance_id | VARCHAR | GTS plugin instance ID (ChatEngineBackendPlugin registered in ClientHub, see ADR-0026) |
+| plugin_instance_id | VARCHAR | GTS plugin instance ID — references an internal ChatEngineBackendPlugin implementation (see ADR-0026) |
 | summarization_settings | JSONB NULL | Optional summarization configuration |
-| meta | JSONB | Additional configuration metadata |
+| metadata | JSONB | Plugin-specific configuration |
 | created_at | TIMESTAMPTZ | Creation timestamp |
 | updated_at | TIMESTAMPTZ | Last modification timestamp |
 

@@ -1,3 +1,5 @@
+Created:  2026-03-06 by Constructor Tech
+Updated:  2026-03-06 by Constructor Tech
 # Chat Engine JSON Schemas
 
 This directory contains JSON Schema definitions (Draft 7) for the Chat Engine API.

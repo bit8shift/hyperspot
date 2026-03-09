@@ -1,4 +1,4 @@
-Created:  2026-03-06 by Constructor Tech
+Created:  2026-02-04 by Constructor Tech
 Updated:  2026-03-06 by Constructor Tech
 # ADR-0018: Session Type Switching with Capability Updates
 
@@ -6,7 +6,7 @@ Updated:  2026-03-06 by Constructor Tech
 
 **Status**: accepted
 
-**ID**: `fdd-chat-engine-adr-session-switching`
+**ID**: `cpt-chat-engine-adr-session-switching`
 
 ## Context and Problem Statement
 
@@ -36,33 +36,57 @@ Chosen option: "Update session_type_id, route next message to new backend", beca
 ### Consequences
 
 * Good, because single session retains full conversation history
-* Good, because new backend receives complete history (all messages)
+* Good, because new plugin receives complete history (all messages)
 * Good, because client API simple (session.switch_type event)
 * Good, because no message duplication or data migration
-* Good, because capabilities updated from new backend
+* Good, because `available_capabilities` refreshed from new plugin via `on_session_type_configured`
 * Good, because session metadata (title, timestamps) preserved
-* Bad, because history mixing backends may confuse some backend implementations
+* Bad, because history mixing plugins may confuse some plugin implementations
 * Bad, because old capabilities become stale (stored but inactive)
-* Bad, because cannot easily revert to previous backend (no capability restoration)
-* Bad, because backend type history not tracked per message
+* Bad, because cannot easily revert to previous plugin (no capability restoration)
+* Bad, because plugin type history not tracked per message
+
+### Confirmation
+
+Confirmed when switching `session_type_id` causes the next message to be routed to the new plugin, `Session.enabled_capabilities` is updated from the new `SessionType.available_capabilities`, and full conversation history is passed to the new plugin's `on_message` call.
+
+## Pros and Cons of the Options
+
+### Option 1: Update session_type_id, route next message to new plugin (chosen)
+
+* Good, because single session retains full history
+* Good, because simple client API
+* Bad, because history mixing plugins may cause unexpected behavior
+
+### Option 2: Create new session, copy history
+
+* Good, because clean separation between old and new plugin contexts
+* Bad, because message duplication; breaks session continuity for the client
+* Bad, because complex migration logic required
+
+### Option 3: Message-level backend tracking
+
+* Good, because precise tracking of which plugin handled each message
+* Bad, because routing complexity grows as history spans multiple plugins
+* Bad, because no single authoritative capability set for a session
 
 ## Related Design Elements
 
 **Actors**:
-* `fdd-chat-engine-actor-client` - Initiates session type switching
-* `fdd-chat-engine-actor-webhook-backend` - New backend receives full history
-* `fdd-chat-engine-session-management` - Updates session_type_id
+* `cpt-chat-engine-actor-client` - Initiates session type switching
+* `cpt-chat-engine-actor-backend-plugin` - New plugin receives full history
+* `cpt-chat-engine-session-management` - Updates session_type_id
 
 **Requirements**:
-* `fdd-chat-engine-fr-switch-session-type` - Switch to different backend mid-conversation
-* `fdd-chat-engine-fr-send-message` - Routing uses current session_type_id
+* `cpt-chat-engine-fr-switch-session-type` - Switch to different backend mid-conversation
+* `cpt-chat-engine-fr-send-message` - Routing uses current session_type_id
 
 **Design Elements**:
-* `fdd-chat-engine-entity-session` - session_type_id field (mutable)
-* `fdd-chat-engine-entity-session-type` - Defines webhook_url per backend
+* `cpt-chat-engine-entity-session` - session_type_id field (mutable)
+* `cpt-chat-engine-entity-session-type` - References `plugin_instance_id` per backend type
 * Sequence diagram S4 (Switch Session Type Mid-Conversation)
 
 **Related ADRs**:
-* ADR-0002 (Capability Model) - New backend returns updated capabilities
-* ADR-0006 (Webhook Protocol) - New backend receives message.new with full history
+* ADR-0002 (Capability Model) - New plugin provides updated `available_capabilities` via `on_session_type_configured`
+* ADR-0026 (Plugin Backend Integration) - Plugin trait methods; `on_message` receives full history
 * ADR-0022 (Per-Request Capability Filtering) - Client can enable/disable capabilities per message

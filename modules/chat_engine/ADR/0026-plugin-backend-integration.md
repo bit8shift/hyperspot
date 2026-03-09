@@ -1,5 +1,5 @@
-Created:  2026-03-06 by Constructor Tech
-Updated:  2026-03-06 by Constructor Tech
+Created:  2026-02-23 by Constructor Tech
+Updated:  2026-03-09 by Constructor Tech
 # ADR-0026: Internal Plugin Interface for Backend Integration
 
 **Date**: 2026-02-23
@@ -10,92 +10,119 @@ Updated:  2026-03-06 by Constructor Tech
 
 ## Context and Problem Statement
 
-ADR-0006 established HTTP webhooks as the integration mechanism between Chat Engine and message-processing backends. While HTTP webhooks work, they introduce significant operational complexity that must be re-implemented by every Chat Engine deployment:
+ADR-0006 established HTTP webhooks as the integration mechanism between Chat Engine and message-processing backends: Chat Engine made outbound HTTP POST requests to a `webhook_url` configured per session type and handled all resilience concerns (auth, retry, circuit breaker, timeout) itself. This approach couples Chat Engine to transport-level details and forces every deployment to duplicate resilience infrastructure.
 
-- **Authentication**: Backend must validate incoming webhook requests (HMAC, JWT, mutual TLS)
-- **Retry logic**: Chat Engine must implement exponential backoff with per-backend configuration
-- **Circuit breaker**: Per-session-type circuit state to isolate failing backends (ADR-0011)
-- **Throttling**: Rate limiting to protect backends from overload
-- **Timeout management**: Per-backend timeouts with config storage (ADR-0013)
-- **External network call**: Even co-located backends require an HTTP round-trip with serialization overhead
-
-In practice, most backends are **co-located modules** within the same CyberFabric server process. Treating them as external HTTP services adds unnecessary complexity and latency. CyberFabric already provides the **CyberFabric ModKit Gateway + Plugin pattern** that solves all of these concerns at the framework level.
+In practice, backend integrations are implemented as **code modules within Chat Engine** — not as independently deployed external services. A plugin is a Rust module inside the Chat Engine codebase that implements the `ChatEngineBackendPlugin` trait. The plugin decides how to communicate with external services (HTTP to LLM gateway, vector DB, etc.); Chat Engine is not involved in that transport. How should Chat Engine integrate with backend plugins while keeping its core free of transport, auth, and resilience logic?
 
 ## Decision Drivers
 
-* Eliminate webhook infrastructure complexity (auth, retry, circuit breaker, throttling) from Chat Engine itself
-* Enable zero-overhead in-process calls for co-located backend modules
-* Leverage existing CyberFabric plugin discovery (`types-registry` + `ClientHub`)
-* Allow plugin vendors to implement external webhooks internally if needed — without Chat Engine knowing or caring
-* Align with the established architectural pattern used across CyberFabric
-* Simplify session type configuration (no `webhook_url` needed for native plugins)
+* Chat Engine core must not contain transport, auth, retry, or circuit breaker logic
+* Plugins are internal code within Chat Engine — a plugin is a trait implementation, not an external service
+* Each plugin independently decides how to communicate with external services it depends on
+* Request/response format between a plugin and its external service must conform to Chat Engine schemas
+* Session type configuration must reference a specific plugin by `plugin_instance_id`
+* A compatibility path for legacy HTTP webhook-based services must exist without changes to Chat Engine core
 
 ## Considered Options
 
-* **Option 1: HTTP webhooks (current)** — Chat Engine makes external HTTP POST to `webhook_url` stored per session type; handles auth, retry, circuit breaker itself
-* **Option 2: CyberFabric Plugin System** — Chat Engine acts as a Gateway module; backends register as Plugin modules via `types-registry`; Chat Engine calls them through `ClientHub`
-* **Option 3: Hybrid** — Native plugin interface as primary; HTTP webhook adapter plugin available for external backends
+* **Option 1: HTTP webhooks (ADR-0006)** — Chat Engine makes outbound HTTP POST to `webhook_url` per session type; manages auth, retry, circuit breaker itself
+* **Option 2: Internal plugin trait** — plugins are code inside Chat Engine implementing `ChatEngineBackendPlugin`; Chat Engine calls trait methods directly; each plugin manages its own outbound communication
+* **Option 3: Hybrid** — internal plugin trait as primary; a first-party `webhook-compat` plugin wraps legacy HTTP webhook-based external services
 
 ## Decision Outcome
 
-Chosen option: **Option 3 (Hybrid)**, with Plugin System as the primary interface.
+Chosen option: **Option 3 (Hybrid)**, with the internal plugin interface as the primary integration mechanism.
 
-Chat Engine becomes a **Gateway module** that calls backend implementations via `dyn ChatEngineBackendPlugin`. A first-party **`chat-engine-webhook-adapter`** plugin wraps any external HTTP backend, so webhook-based backends remain supported — but the complexity of auth, retry, circuit breaker, and throttling is moved into the adapter plugin, not Chat Engine core.
+Chat Engine defines a `ChatEngineBackendPlugin` trait. Plugins are Rust modules inside the Chat Engine codebase that implement this trait and are registered in Chat Engine's internal plugin registry at startup. A session type references its plugin via `plugin_instance_id` (a GTS ID string). On each operation, Chat Engine looks up the plugin by `plugin_instance_id` and calls the appropriate trait method.
 
-On each API call (message send, session create, etc.) Chat Engine resolves the session type's `plugin_instance_id` to a `dyn ChatEngineBackendPlugin` via `ClientHub`, then calls the appropriate plugin method which streams response chunks back. Backend plugins (LLM, RAG, webhook adapter, etc.) each independently implement the same trait and register with `types-registry` at startup.
+Plugins own all outbound communication. For example, the LLM gateway plugin makes HTTP requests to the LLM gateway service using request/response schemas derived from Chat Engine base schemas. During `on_session_type_configured`, the LLM gateway plugin queries the **Model Registry** service to retrieve the capabilities supported by the configured model (available parameters, allowed values, defaults) and returns them as `Vec<Capability>`. The first-party `webhook-compat` plugin similarly makes outbound HTTP requests to legacy webhook endpoints, keeping Chat Engine core free of any webhook logic.
 
 ### Consequences
 
-* Good, because Chat Engine core has zero authentication, retry, or circuit breaker code
-* Good, because co-located plugins have zero HTTP overhead (direct Rust trait call)
-* Good, because plugin vendors have full control over resilience strategy for external backends
-* Good, because existing webhook-based backends continue to work via the adapter plugin
-* Good, because capability declaration is type-safe (Rust trait, validated at compile time)
-* Good, because plugin discovery uses the same `types-registry` + GTS pattern as all other CyberFabric modules
-* Good, because `SessionType.webhook_url` is replaced by a `plugin_instance_id` (GTS ID) — simpler, versioned
-* Bad, because plugin backends must be included in the server build (no dynamic load at runtime without restart)
-* Bad, because the webhook adapter adds a thin indirection layer for external backends
-* Bad, because ADR-0011 (circuit breaker) and ADR-0013 (timeout) become plugin responsibilities, not Chat Engine's — existing deployments depending on these must migrate to the adapter
+* Good, because Chat Engine core has zero auth, retry, circuit breaker, or timeout code
+* Good, because plugin-to-external-service communication is fully encapsulated in the plugin
+* Good, because request/response format is governed by Chat Engine schemas — plugins cannot break the contract
+* Good, because `SessionType.available_capabilities` is populated by the plugin via `on_session_type_configured`, eliminating developer-plugin catalog drift
+* Good, because the `webhook-compat` plugin preserves backward compatibility for existing HTTP webhook services
+* Bad, because adding a new plugin requires a code change and rebuild of Chat Engine
+* Bad, because the `webhook-compat` plugin adds a thin indirection layer for legacy webhook services
+
+### Confirmation
+
+Confirmed when:
+
+- A session type configured with `plugin_instance_id` calls the correct plugin trait method on each operation
+- `on_session_type_configured` is called on session type setup and its result stored as `SessionType.available_capabilities`
+- LLM gateway plugin queries Model Registry during `on_session_type_configured` to resolve available capabilities for the configured model
+- LLM gateway plugin successfully makes HTTP requests to the LLM gateway service using Chat Engine-derived schemas
+- `webhook-compat` plugin wraps a legacy HTTP webhook service without any changes to Chat Engine core
+
+## Pros and Cons of the Options
+
+### Option 1: HTTP webhooks (ADR-0006)
+
+Chat Engine makes outbound HTTP POST to `webhook_url` per session type and manages all resilience logic.
+
+* Good, because any HTTP server can serve as a backend without code inside Chat Engine
+* Bad, because Chat Engine must implement and maintain auth, retry, circuit breaker, and timeout per session type
+* Bad, because `webhook_url` is an unversioned string with no schema enforcement
+
+### Option 2: Internal plugin trait (pure)
+
+Plugins are code inside Chat Engine; no compatibility mechanism for external HTTP services.
+
+* Good, because zero transport boilerplate in Chat Engine core
+* Good, because trait interface is type-safe and schema-enforced at compile time
+* Bad, because legacy webhook-based services cannot integrate without being rewritten as plugins
+
+### Option 3: Hybrid (chosen)
+
+Internal plugin trait as primary; `webhook-compat` plugin wraps legacy HTTP webhook services.
+
+* Good, because Chat Engine core stays transport-free
+* Good, because legacy HTTP webhook services remain supported via the compat plugin
+* Good, because plugin is authoritative for capabilities, schemas, and resilience strategy
+* Bad, because new plugins require a Chat Engine code change and rebuild
 
 ## Plugin API Contract
 
-Chat Engine defines a `ChatEngineBackendPlugin` trait in the `chat-engine-sdk` crate. Plugin methods are: `on_session_created` (called on session creation, returns available capabilities), `on_message` (streams response chunks), `on_message_recreate` (streams regenerated response), `on_session_summary` (streams summary), and an optional `health_check`. Full trait and context struct definitions are in `chat-engine-sdk` and documented in DESIGN.md §3.3.2.
+Chat Engine defines the `ChatEngineBackendPlugin` trait in the `chat-engine-sdk` crate. Plugin methods:
 
-## N:1 Session Types → Plugin Relationship
+| Method | Trigger | Returns |
+|--------|---------|---------|
+| `on_session_type_configured` | Session type is configured with this plugin | `Vec<Capability>` stored as `SessionType.available_capabilities` |
+| `on_session_created` | Session is created | Establishes any per-session plugin state |
+| `on_message` | User sends a message | `ResponseStream` of content chunks |
+| `on_message_recreate` | User recreates a message | `ResponseStream` of content chunks |
+| `on_session_summary` | Summarization triggered | `ResponseStream` of summary content |
+| `health_check` | Optional liveness probe | Health status |
 
-Multiple session types can share the same `plugin_instance_id`. Each session type carries its own `meta` configuration bag that Chat Engine forwards to the plugin in every call context (`session_type_meta` field). This allows a single plugin instance to serve multiple differently-configured session types without code duplication — for example, a single LLM plugin serving separate session types for GPT-4o (files enabled), GPT-4o (files disabled), and GPT-4o-mini, each differing only in their `meta`.
+Full trait and context struct definitions are in `chat-engine-sdk` and documented in DESIGN.md §3.3.2.
 
-The call context passed to every plugin method includes both `session_type_id` and `session_type_meta`, so plugins branch on configuration without needing to know the session type at registration time. See DESIGN.md Plugin Integration for details.
+## N:1 Session Types → Plugin
 
-## Session Type Configuration Change
-
-| Before (ADR-0006) | After (ADR-0026) |
-|---|---|
-| `session_type.webhook_url: String` | `session_type.plugin_instance_id: GtsPluginInstanceId` |
-| `session_type.timeout_seconds: u32` | Timeout owned by the plugin (or adapter config) |
-| Chat Engine manages circuit breaker state | Plugin/adapter manages circuit breaker state |
-
-## Migration Path
-
-1. Existing deployments using HTTP webhooks: deploy `chat-engine-webhook-adapter` plugin pointing to current `webhook_url`
-2. Session types: replace `webhook_url` with `plugin_instance_id` of the adapter instance
-3. New backends: implement `dyn ChatEngineBackendPlugin` directly
+Multiple session types can share the same `plugin_instance_id`. Each session type carries a `metadata` configuration bag forwarded to the plugin in every call context (`session_type_metadata` field). This allows a single plugin instance to serve multiple differently-configured session types — for example, a single LLM gateway plugin serving session types that differ only in system prompt or default model.
 
 ## Related Design Elements
 
 **Actors**:
-* `cpt-chat-engine-actor-backend-plugin` — replaces `cpt-chat-engine-actor-webhook-backend`
+
+* `cpt-chat-engine-actor-backend-plugin` — internal plugin code within Chat Engine; implements `ChatEngineBackendPlugin` trait
 
 **Requirements**:
-* `cpt-chat-engine-fr-send-message` — plugin call replaces webhook POST
-* `cpt-chat-engine-fr-create-session` — plugin call replaces session.created event
-* `cpt-chat-engine-fr-schema-extensibility` — plugin schema registration via GTS
+
+* `cpt-chat-engine-fr-send-message` — plugin `on_message` call replaces webhook POST
+* `cpt-chat-engine-fr-create-session` — plugin `on_session_created` call replaces session.created webhook event
+* `cpt-chat-engine-fr-schema-extensibility` — plugin registers GTS derived schemas at startup
 
 **Superseded ADRs**:
-* ADR-0006 (Webhook Protocol) — superseded by this ADR
-* ADR-0011 (Circuit Breaker) — responsibility moved to plugin/adapter
-* ADR-0013 (Timeout Configuration) — responsibility moved to plugin/adapter
+
+* ADR-0006 (Webhook Protocol) — superseded; `webhook_url` replaced by `plugin_instance_id`
+* ADR-0011 (Circuit Breaker) — responsibility moved to plugin
+* ADR-0013 (Timeout Configuration) — responsibility moved to plugin
 
 **Related ADRs**:
-* ADR-0003 (Streaming Architecture) — streaming model unchanged; plugin provides `ResponseStream`
-* ADR-0010 (Stateless Scaling) — unchanged; plugin clients resolved per-request from `ClientHub`
+
+* ADR-0003 (Streaming Architecture) — unchanged; plugin provides `ResponseStream`
+* ADR-0010 (Stateless Scaling) — unchanged; plugin resolved per-request from registry
+* ADR-0027 (LLM Gateway Plugin) — LLM gateway plugin: capability resolution via Model Registry, schema extensions, message processing via LLM gateway service

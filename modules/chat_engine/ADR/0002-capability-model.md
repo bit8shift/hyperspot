@@ -1,4 +1,4 @@
-Created:  2026-03-06 by Constructor Tech
+Created:  2026-02-04 by Constructor Tech
 Updated:  2026-03-06 by Constructor Tech
 # ADR-0002: Capability Model
 
@@ -6,7 +6,7 @@ Updated:  2026-03-06 by Constructor Tech
 
 **Status**: accepted
 
-**ID**: `fdd-chat-engine-adr-capability-model`
+**ID**: `cpt-chat-engine-adr-capability-model`
 
 ## Context and Problem Statement
 
@@ -25,12 +25,12 @@ Chat Engine needs to support different session types with varying capabilities (
 
 ## Considered Options
 
-* **Option 1: Developer configures catalog, user selects values** - Developer declares `SessionType.available_capabilities` (static max set); user selects `Session.enabled_capabilities` (specific values) from that catalog
+* **Option 1: Plugin provides catalog during session type configuration, user selects values** - When a session type is configured with a plugin, Chat Engine calls `plugin.on_session_type_configured()` which returns `Vec<Capability>` stored as `SessionType.available_capabilities` (static max set); user selects `Session.enabled_capabilities` (specific values) from that catalog
 * **Option 2: Capabilities configured in Chat Engine only** - Admin configures capabilities via Chat Engine UI/API per session type with no user-level selection
 
 ## Decision Outcome
 
-Chosen option: "Developer configures catalog, user selects values", because it separates the concerns of capability definition (developer/admin responsibility) from capability activation (user responsibility), enables pre-session UI discoverability, gives users control over cost optimization and feature selection, and keeps Chat Engine agnostic to capability semantics.
+Chosen option: "Plugin provides catalog during session type configuration, user selects values", because it separates the concerns of capability definition (plugin responsibility, declared once at configuration time) from capability activation (user responsibility), enables pre-session UI discoverability, gives users control over cost optimization and feature selection, keeps Chat Engine agnostic to capability semantics, and eliminates the developer-plugin sync burden.
 
 ### Consequences
 
@@ -41,8 +41,8 @@ Chosen option: "Developer configures catalog, user selects values", because it s
 * Good, because users control capability activation and values (cost optimization, privacy)
 * Good, because Chat Engine doesn't need to understand capability semantics (stores and forwards)
 * Good, because adding new capabilities requires only developer configuration, not infrastructure changes
-* Bad, because developer must keep `SessionType.available_capabilities` consistent with backend plugin expectations
-* Bad, because Chat Engine cannot validate capability correctness (trusts developer configuration)
+* Good, because plugin-provided capabilities eliminate developer-plugin sync burden — the plugin is the authoritative source
+* Bad, because Chat Engine cannot validate capability correctness (trusts plugin-returned configuration)
 * Bad, because capability schema is not enforced beyond basic type checking
 
 ### Confirmation
@@ -51,14 +51,14 @@ Confirmed when `SessionType` schema requires `available_capabilities` as a non-o
 
 ## Pros and Cons of the Options
 
-### Option 1: Developer configures catalog, user selects values
+### Option 1: Plugin provides catalog during session type configuration, user selects values
 
-Developer declares `SessionType.available_capabilities`; user selects `Session.enabled_capabilities` from that catalog.
+When a session type is configured with a plugin, `on_session_type_configured()` returns `Vec<Capability>` stored as `SessionType.available_capabilities`; user selects `Session.enabled_capabilities` from that catalog.
 
 * Good, because pre-session discoverability via static catalog
-* Good, because separation of concerns — definition (developer) vs. activation (user)
+* Good, because separation of concerns — definition (plugin) vs. activation (user)
 * Good, because user-controlled cost optimization and feature selection
-* Bad, because developer must keep catalog in sync with backend plugin expectations
+* Good, because plugin is the authoritative source — no developer-plugin catalog drift
 
 ### Option 2: Capabilities configured in Chat Engine only
 
@@ -71,20 +71,20 @@ Admin configures capabilities via Chat Engine UI/API per session type with no us
 ## Related Design Elements
 
 **Actors**:
-* `fdd-chat-engine-actor-developer` - Declares `SessionType.available_capabilities` catalog (required field)
-* `fdd-chat-engine-actor-client` - Selects `Session.enabled_capabilities` from the catalog; enables/disables features in UI
-* `fdd-chat-engine-actor-webhook-backend` - Receives user-selected `CapabilityValue[]` per message (see ADR-0022); does not define capabilities
+* `cpt-chat-engine-actor-developer` - Configures a session type by assigning a plugin; `available_capabilities` are populated automatically via `plugin.on_session_type_configured()`
+* `cpt-chat-engine-actor-client` - Selects `Session.enabled_capabilities` from the catalog; enables/disables features in UI
+* `cpt-chat-engine-actor-backend-plugin` - Receives user-selected `CapabilityValue[]` per message (see ADR-0022); does not define capabilities
 
 **Requirements**:
-* `fdd-chat-engine-fr-create-session` - Session stores user-selected `enabled_capabilities`
-* `fdd-chat-engine-fr-switch-session-type` - New session type catalog replaces available capabilities
+* `cpt-chat-engine-fr-create-session` - Session stores user-selected `enabled_capabilities`
+* `cpt-chat-engine-fr-switch-session-type` - New session type catalog replaces available capabilities
 
 **Design Elements**:
-* `fdd-chat-engine-entity-session-type` - Includes `available_capabilities: Capability[]` (developer-configured catalog, required field)
-* `fdd-chat-engine-entity-session` - Stores `enabled_capabilities: Capability[]` (user-selected subset of the catalog)
-* `fdd-chat-engine-entity-capability` - `Capability` schema: `{id, name, description?, type, default_value, enum_values?}` — used in both tiers
-* `fdd-chat-engine-entity-capability-value` - `CapabilityValue` schema: `{id, value}` — per-message capability override (see ADR-0022)
-* `fdd-chat-engine-principle-webhook-authority` - Backend plugin receives selected capabilities but does not define them
+* `cpt-chat-engine-entity-session-type` - Includes `available_capabilities: Capability[]` (developer-configured catalog, required field)
+* `cpt-chat-engine-entity-session` - Stores `enabled_capabilities: Capability[]` (user-selected subset of the catalog)
+* `cpt-chat-engine-entity-capability` - `Capability` schema: `{id, name, description?, type, default_value, enum_values?}` — used in both tiers
+* `cpt-chat-engine-entity-capability-value` - `CapabilityValue` schema: `{id, value}` — per-message capability override (see ADR-0022)
+* `cpt-chat-engine-principle-plugin-authority` - Backend plugin declares available capabilities via `on_session_type_configured` and receives user-selected values per message
 
 **Related ADRs**:
 * ADR-0006 (Webhook Protocol) - Defines events using `enabled_capabilities`
