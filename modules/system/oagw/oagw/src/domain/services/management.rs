@@ -759,9 +759,9 @@ fn endpoints_are_ip(endpoints: &[Endpoint]) -> bool {
 /// - Single host, standard port → hostname
 /// - Single host, non-standard port → hostname:port
 /// - Multiple hosts, all identical → treated as single-host
-/// - Multiple hosts, common domain suffix (≥2 labels) → common suffix
-///   (port is intentionally dropped — the suffix is a grouping label,
-///   not a connect target)
+/// - Multiple hosts, common domain suffix (≥2 labels) → common suffix;
+///   non-standard port is appended (e.g., `vendor.com:8443`) to avoid
+///   collisions between pools on different ports
 /// - Multiple hosts, no common suffix → `None`
 /// - IP addresses → `None`
 fn compute_derived_alias(endpoints: &[Endpoint]) -> Option<String> {
@@ -784,9 +784,19 @@ fn compute_derived_alias(endpoints: &[Endpoint]) -> Option<String> {
         return Some(unique[0].to_string());
     }
 
-    // Multi-host: extract hosts (without port) for common suffix computation.
+    // Multi-host: extract pure hostnames for common suffix computation.
     let hosts: Vec<String> = endpoints.iter().map(|e| e.normalized_host()).collect();
-    common_domain_suffix(&hosts)
+    let suffix = common_domain_suffix(&hosts)?;
+
+    // Append :port when the pool uses a non-standard port so that
+    // pools with the same domain suffix but different ports get
+    // distinct aliases (e.g., `vendor.com` vs `vendor.com:8443`).
+    // validate_endpoints guarantees all endpoints share the same port.
+    if endpoints[0].is_standard_port() {
+        Some(suffix)
+    } else {
+        Some(format!("{suffix}:{}", endpoints[0].port))
+    }
 }
 
 /// Extract the longest common domain suffix from a set of hostnames.
@@ -3373,6 +3383,23 @@ mod tests {
     }
 
     #[test]
+    fn compute_derived_alias_multi_host_common_suffix_non_standard_port() {
+        let eps = vec![
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "us.vendor.com".into(),
+                port: 8443,
+            },
+            Endpoint {
+                scheme: Scheme::Https,
+                host: "eu.vendor.com".into(),
+                port: 8443,
+            },
+        ];
+        assert_eq!(compute_derived_alias(&eps), Some("vendor.com:8443".into()));
+    }
+
+    #[test]
     fn compute_derived_alias_multi_host_deeper_common_suffix() {
         let eps = vec![
             Endpoint {
@@ -3817,6 +3844,72 @@ mod tests {
         };
         let u = svc.create_upstream(&ctx, req).await.unwrap();
         assert_eq!(u.alias, "vendor.com");
+    }
+
+    #[tokio::test]
+    async fn multi_endpoint_same_suffix_different_ports_get_distinct_aliases() {
+        let svc = make_service();
+        let tenant = Uuid::new_v4();
+        let ctx = test_ctx(tenant);
+
+        // Pool A: non-standard port 8443.
+        let req_a = CreateUpstreamRequest {
+            server: Server {
+                endpoints: vec![
+                    Endpoint {
+                        scheme: Scheme::Https,
+                        host: "us.vendor.com".into(),
+                        port: 8443,
+                    },
+                    Endpoint {
+                        scheme: Scheme::Https,
+                        host: "eu.vendor.com".into(),
+                        port: 8443,
+                    },
+                ],
+            },
+            protocol: "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1".into(),
+            alias: None,
+            auth: None,
+            headers: None,
+            plugins: None,
+            rate_limit: None,
+            tags: vec![],
+            enabled: true,
+        };
+        let u_a = svc.create_upstream(&ctx, req_a).await.unwrap();
+        assert_eq!(u_a.alias, "vendor.com:8443");
+
+        // Pool B: non-standard port 9443 — same hosts, different port.
+        let req_b = CreateUpstreamRequest {
+            server: Server {
+                endpoints: vec![
+                    Endpoint {
+                        scheme: Scheme::Https,
+                        host: "us.vendor.com".into(),
+                        port: 9443,
+                    },
+                    Endpoint {
+                        scheme: Scheme::Https,
+                        host: "eu.vendor.com".into(),
+                        port: 9443,
+                    },
+                ],
+            },
+            protocol: "gts.x.core.oagw.protocol.v1~x.core.oagw.http.v1".into(),
+            alias: None,
+            auth: None,
+            headers: None,
+            plugins: None,
+            rate_limit: None,
+            tags: vec![],
+            enabled: true,
+        };
+        let u_b = svc.create_upstream(&ctx, req_b).await.unwrap();
+        assert_eq!(u_b.alias, "vendor.com:9443");
+
+        // Both stored separately — no 409 conflict.
+        assert_ne!(u_a.id, u_b.id);
     }
 
     #[tokio::test]

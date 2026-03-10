@@ -293,7 +293,7 @@ Alias behavior is determined entirely by endpoint type. Hostname-based endpoints
 - Single hostname, standard port → hostname (e.g., `api.openai.com`)
 - Single hostname, non-standard port → hostname:port (e.g., `api.openai.com:8443`)
 - Multiple hostnames, all identical → treated as single-host
-- Multiple hostnames, common domain suffix (≥2 labels) → common suffix (e.g., `vendor.com`); port intentionally dropped
+- Multiple hostnames, common domain suffix (≥2 labels) → common suffix (e.g., `vendor.com`); non-standard port appended (e.g., `vendor.com:8443`)
 - Multiple hostnames, no common suffix (only TLD in common) → `None` (explicit required)
 - IP addresses → `None` (explicit required)
 
