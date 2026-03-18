@@ -1125,6 +1125,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "de0707_drop_zeroize"
+version = "0.1.0"
+dependencies = [
+ "clippy_utils",
+ "dylint_linting",
+ "dylint_testing",
+ "lint_utils",
+]
+
+[[package]]
 name = "de0801_api_endpoint_version"
 version = "0.1.0"
 dependencies = [
@@ -1194,6 +1204,18 @@ dependencies = [
  "dylint_testing",
  "lint_utils",
  "tokio",
+]
+
+[[package]]
+name = "de1303_no_primitive_type_alias"
+version = "0.1.0"
+dependencies = [
+ "clippy_utils",
+ "dylint_linting",
+ "dylint_testing",
+ "lint_utils",
+ "serde_json",
+ "uuid",
 ]
 
 [[package]]

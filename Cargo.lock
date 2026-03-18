@@ -1167,6 +1167,7 @@ dependencies = [
  "async-trait",
  "cf-modkit",
  "cf-modkit-security",
+ "cf-tenant-resolver-sdk",
  "gts",
  "gts-macros",
  "schemars 1.2.1",
@@ -1174,6 +1175,7 @@ dependencies = [
  "serde_json",
  "thiserror 2.0.18",
  "uuid",
+ "zeroize",
 ]
 
 [[package]]
